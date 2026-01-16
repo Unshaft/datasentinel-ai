@@ -1,0 +1,122 @@
+{
+  "rules": [
+    {
+      "id": "rule_null_threshold",
+      "text": "Une colonne avec plus de 30% de valeurs nulles doit être signalée comme problème de qualité majeur",
+      "type": "constraint",
+      "severity": "high",
+      "category": "completeness"
+    },
+    {
+      "id": "rule_unique_id",
+      "text": "Les colonnes identifiées comme ID ou clé primaire doivent avoir 100% de valeurs uniques",
+      "type": "constraint",
+      "severity": "critical",
+      "category": "uniqueness"
+    },
+    {
+      "id": "rule_email_format",
+      "text": "Les colonnes de type email doivent respecter le format standard email avec @ et domaine valide",
+      "type": "format",
+      "severity": "medium",
+      "category": "validity"
+    },
+    {
+      "id": "rule_date_consistency",
+      "text": "Les dates de fin doivent toujours être postérieures aux dates de début dans un même enregistrement",
+      "type": "consistency",
+      "severity": "high",
+      "category": "consistency"
+    },
+    {
+      "id": "rule_positive_amounts",
+      "text": "Les montants financiers (prix, revenus, coûts) doivent être positifs ou nuls",
+      "type": "constraint",
+      "severity": "high",
+      "category": "validity"
+    },
+    {
+      "id": "rule_age_range",
+      "text": "Les valeurs d'âge doivent être comprises entre 0 et 150 ans",
+      "type": "constraint",
+      "severity": "medium",
+      "category": "validity"
+    },
+    {
+      "id": "rule_percentage_range",
+      "text": "Les pourcentages doivent être compris entre 0 et 100",
+      "type": "constraint",
+      "severity": "medium",
+      "category": "validity"
+    },
+    {
+      "id": "rule_phone_format",
+      "text": "Les numéros de téléphone doivent contenir uniquement des chiffres, espaces, tirets ou le symbole +",
+      "type": "format",
+      "severity": "low",
+      "category": "validity"
+    },
+    {
+      "id": "rule_duplicate_detection",
+      "text": "Les enregistrements avec plus de 90% de valeurs identiques sur les colonnes clés sont considérés comme doublons potentiels",
+      "type": "constraint",
+      "severity": "medium",
+      "category": "uniqueness"
+    },
+    {
+      "id": "rule_categorical_cardinality",
+      "text": "Une colonne catégorielle avec plus de 1000 valeurs uniques devrait être revue - possible erreur de type",
+      "type": "validation",
+      "severity": "low",
+      "category": "consistency"
+    },
+    {
+      "id": "rule_numeric_outliers",
+      "text": "Les valeurs numériques au-delà de 3 écarts-types de la moyenne sont des outliers potentiels à investiguer",
+      "type": "validation",
+      "severity": "medium",
+      "category": "accuracy"
+    },
+    {
+      "id": "rule_timestamp_future",
+      "text": "Les timestamps ne doivent pas être dans le futur sauf pour les colonnes explicitement prévues pour cela",
+      "type": "constraint",
+      "severity": "medium",
+      "category": "timeliness"
+    },
+    {
+      "id": "rule_referential_integrity",
+      "text": "Les clés étrangères doivent référencer des valeurs existantes dans la table parente",
+      "type": "constraint",
+      "severity": "critical",
+      "category": "consistency"
+    },
+    {
+      "id": "rule_encoding_consistency",
+      "text": "Les textes doivent utiliser un encodage UTF-8 cohérent sans caractères corrompus",
+      "type": "format",
+      "severity": "medium",
+      "category": "validity"
+    },
+    {
+      "id": "rule_required_fields",
+      "text": "Les champs marqués comme obligatoires ne doivent jamais être null ou vides",
+      "type": "constraint",
+      "severity": "critical",
+      "category": "completeness"
+    }
+  ],
+  "metadata": {
+    "version": "1.0.0",
+    "description": "Règles métier par défaut pour la validation de qualité des données",
+    "categories": [
+      "completeness",
+      "uniqueness",
+      "validity",
+      "consistency",
+      "accuracy",
+      "timeliness"
+    ],
+    "last_updated": "2024-01-01"
+  }
+}

@@ -1,0 +1,104 @@
+# =============================================================================
+# DataSentinel AI - Docker Compose
+# =============================================================================
+# Configuration pour le développement local et les tests
+# =============================================================================
+
+version: "3.8"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Application principale
+  # ---------------------------------------------------------------------------
+  datasentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: datasentinel-api
+    ports:
+      - "8000:8000"
+    environment:
+      # API Configuration
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+
+      # Anthropic (à fournir au runtime)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+      # ChromaDB
+      - CHROMA_PERSIST_PATH=/app/data/chroma
+
+      # Model
+      - CLAUDE_MODEL=claude-3-5-sonnet-20241022
+      - CLAUDE_TEMPERATURE=0.1
+
+      # Agent Configuration
+      - CONFIDENCE_THRESHOLD=0.7
+      - MAX_AGENT_ITERATIONS=10
+
+    volumes:
+      # Persistance des données ChromaDB
+      - chroma_data:/app/data/chroma
+      # Règles métier (lecture seule)
+      - ./data/rules:/app/data/rules:ro
+      # Datasets d'exemple (lecture seule)
+      - ./data/samples:/app/data/samples:ro
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    restart: unless-stopped
+
+    # Limite les ressources
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Service de développement (avec hot reload)
+  # ---------------------------------------------------------------------------
+  datasentinel-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: datasentinel-dev
+    ports:
+      - "8001:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CHROMA_PERSIST_PATH=/app/data/chroma
+    volumes:
+      # Mount du code source pour hot reload
+      - ./src:/app/src:ro
+      - ./data:/app/data
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+    profiles:
+      - dev
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  chroma_data:
+    driver: local
+    name: datasentinel_chroma
+
+# =============================================================================
+# Networks (optionnel, pour extension future)
+# =============================================================================
+networks:
+  default:
+    name: datasentinel_network
