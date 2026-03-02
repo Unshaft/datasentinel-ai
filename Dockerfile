@@ -36,7 +36,7 @@ FROM python:3.11-slim as runtime
 
 # Métadonnées
 LABEL maintainer="DataSentinel Team" \
-      version="0.1.0" \
+      version="0.4.0" \
       description="DataSentinel AI - Multi-Agent Data Quality System"
 
 # Variables d'environnement

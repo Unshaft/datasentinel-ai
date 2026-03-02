@@ -26,6 +26,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        env_ignore_empty=True,  # ex: CORS_ORIGINS= vide → utilise la valeur par défaut
     )
 
     # ===================
@@ -159,15 +160,49 @@ class Settings(BaseSettings):
     )
 
     # ===================
-    # Security
+    # Security / Auth
     # ===================
     cors_origins: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:8080"],
         description="Origins CORS autorisés"
     )
-    api_secret_key: str | None = Field(
-        default=None,
-        description="Clé secrète pour authentification API"
+    api_secret_key: str = Field(
+        default="changeme-in-production-use-a-long-random-string",
+        description="Clé secrète JWT (doit être longue et aléatoire en production)"
+    )
+    auth_enabled: bool = Field(
+        default=False,
+        description="Activer l'authentification JWT (désactivée par défaut en dev)"
+    )
+    jwt_algorithm: str = Field(
+        default="HS256",
+        description="Algorithme de signature JWT"
+    )
+    jwt_expire_minutes: int = Field(
+        default=60,
+        ge=1,
+        description="Durée de vie du token JWT en minutes"
+    )
+    api_username: str = Field(
+        default="admin",
+        description="Nom d'utilisateur pour l'authentification (dev)"
+    )
+    api_password: str = Field(
+        default="changeme",
+        description="Mot de passe pour l'authentification (dev)"
+    )
+
+    # ===================
+    # Redis / Sessions
+    # ===================
+    redis_url: str = Field(
+        default="redis://localhost:6379",
+        description="URL de connexion Redis"
+    )
+    session_ttl: int = Field(
+        default=3600,
+        ge=60,
+        description="Durée de vie des sessions en secondes (défaut 1h)"
     )
 
     @field_validator("chroma_persist_path", mode="before")

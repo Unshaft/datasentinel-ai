@@ -275,7 +275,7 @@ Tu ne dois PAS:
         # Vérifier si ce sont des dates en string
         sample = non_null.head(100)
         try:
-            pd.to_datetime(sample, errors="raise")
+            pd.to_datetime(sample, errors="raise", format="mixed")
             return "datetime_string"
         except (ValueError, TypeError):
             pass

@@ -5,10 +5,10 @@ Ces schémas définissent la structure des réponses
 pour garantir une API cohérente et documentée.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # =============================================================================
@@ -121,6 +121,12 @@ class AnalyzeResponse(BaseModel):
         description="Nombre de problèmes par sévérité"
     )
 
+    # Score par colonne (v0.4)
+    column_scores: dict[str, float] = Field(
+        default_factory=dict,
+        description="Score de qualité individuel par colonne (0-100)"
+    )
+
     # Escalade
     needs_human_review: bool = Field(
         default=False,
@@ -131,19 +137,19 @@ class AnalyzeResponse(BaseModel):
         description="Raisons de l'escalade"
     )
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "session_id": "session_abc123",
-                "dataset_id": "dataset_def456",
-                "status": "completed",
-                "quality_score": 75.5,
-                "processing_time_ms": 1234,
-                "summary": "Bonne qualité (75.5%) | Problèmes: 3",
-                "issues": [],
-                "needs_human_review": False
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "session_id": "session_abc123",
+            "dataset_id": "dataset_def456",
+            "status": "completed",
+            "quality_score": 75.5,
+            "processing_time_ms": 1234,
+            "summary": "Bonne qualité (75.5%) | Problèmes: 3",
+            "issues": [],
+            "column_scores": {"age": 90.0, "email": 60.0},
+            "needs_human_review": False
         }
+    })
 
 
 class RecommendResponse(BaseModel):
@@ -214,7 +220,7 @@ class FeedbackResponse(BaseModel):
         ...,
         description="Comment ce feedback sera utilisé"
     )
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RuleResponse(BaseModel):
@@ -241,7 +247,7 @@ class HealthResponse(BaseModel):
 
     status: str = Field(..., description="healthy, degraded, unhealthy")
     version: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     # Composants
     components: dict[str, dict[str, Any]] = Field(
@@ -256,18 +262,17 @@ class ErrorResponse(BaseModel):
     error_type: str
     message: str
     details: dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     request_id: str | None = None
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "error_type": "ValidationError",
-                "message": "Les données fournies sont invalides",
-                "details": {"field": "data", "reason": "Aucune donnée fournie"},
-                "request_id": "req_abc123"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "error_type": "ValidationError",
+            "message": "Les données fournies sont invalides",
+            "details": {"field": "data", "reason": "Aucune donnée fournie"},
+            "request_id": "req_abc123"
         }
+    })
 
 
 class SessionListResponse(BaseModel):
@@ -277,3 +282,28 @@ class SessionListResponse(BaseModel):
     total: int
     page: int = 1
     page_size: int = 20
+
+
+# =============================================================================
+# BATCH (v0.5)
+# =============================================================================
+
+
+class BatchResultItem(BaseModel):
+    """Résultat d'analyse pour un fichier dans un batch."""
+
+    filename: str = Field(..., description="Nom du fichier analysé")
+    session_id: str | None = Field(None, description="ID de session (None si erreur)")
+    status: str = Field(..., description="success | error")
+    quality_score: float | None = Field(None, description="Score 0-100 (None si erreur)")
+    issues_count: int = Field(default=0, description="Nombre de problèmes détectés")
+    error: str | None = Field(None, description="Message d'erreur si status=error")
+
+
+class BatchAnalyzeResponse(BaseModel):
+    """Réponse d'analyse batch (plusieurs fichiers)."""
+
+    total: int = Field(..., description="Nombre de fichiers soumis")
+    succeeded: int = Field(..., description="Analyses réussies")
+    failed: int = Field(..., description="Analyses en erreur")
+    results: list[BatchResultItem] = Field(default_factory=list)

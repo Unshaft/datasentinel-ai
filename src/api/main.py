@@ -14,11 +14,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
-from src.api.routes import analyze, explain, feedback, recommend
+from src.api.auth import get_current_user
+from src.api.limiter import limiter
+from src.api.routes import analyze, batch, explain, feedback, recommend, upload
+from src.api.routes import auth as auth_router
+from src.api.routes import webhooks as webhooks_router
 from src.api.schemas.responses import ErrorResponse, HealthResponse
 from src.core.config import settings
 from src.core.exceptions import DataSentinelError
@@ -90,7 +97,7 @@ async def _load_default_rules(store):
 app = FastAPI(
     title="DataSentinel AI",
     description="""
-## Système Multi-Agents pour la Qualité des Données
+## Système Multi-Agents pour la Qualité des Données (v0.5)
 
 DataSentinel AI est un système d'IA agentique capable de:
 - **Analyser** les datasets pour détecter les problèmes de qualité
@@ -112,7 +119,7 @@ Le système utilise 4 agents spécialisés coordonnés par un orchestrateur:
 - ChromaDB pour le RAG et la mémoire
 - Scikit-learn pour la détection d'anomalies
     """,
-    version="0.1.0",
+    version="0.5.0",
     contact={
         "name": "DataSentinel Team",
     },
@@ -125,6 +132,10 @@ Le système utilise 4 agents spécialisés coordonnés par un orchestrateur:
 # =============================================================================
 # MIDDLEWARE
 # =============================================================================
+
+# Rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
 app.add_middleware(
@@ -176,11 +187,23 @@ async def generic_exception_handler(
 # ROUTES
 # =============================================================================
 
-# Inclure les routers
-app.include_router(analyze.router)
-app.include_router(recommend.router)
-app.include_router(explain.router)
-app.include_router(feedback.router)
+# Dépendance d'authentification (no-op si auth_enabled=False)
+_auth_dep = [Depends(get_current_user)]
+
+# Inclure les routers (protégés par JWT quand auth_enabled=True)
+app.include_router(analyze.router,   dependencies=_auth_dep)
+app.include_router(recommend.router, dependencies=_auth_dep)
+app.include_router(explain.router,   dependencies=_auth_dep)
+app.include_router(feedback.router,  dependencies=_auth_dep)
+app.include_router(upload.router,    dependencies=_auth_dep)
+app.include_router(batch.router,     dependencies=_auth_dep)
+# Auth router : pas de protection (c'est le endpoint de login)
+app.include_router(auth_router.router)
+# Webhooks : pas de protection (enregistrement public)
+app.include_router(webhooks_router.router)
+
+# Prometheus — expose /metrics automatiquement
+Instrumentator().instrument(app).expose(app)
 
 
 # Health check

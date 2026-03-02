@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(pip install pyarrow prometheus-fastapi-instrumentator \"python-jose[cryptography]\" \"passlib[bcrypt]\" redis fakeredis -q)",
+      "Bash(python -m pytest tests/unit/test_auth.py tests/unit/test_session_store.py -v --tb=short)",
+      "Bash(python -c \"import pytest_asyncio; print\\(pytest_asyncio.__version__\\)\")"
+    ]
+  }
+}

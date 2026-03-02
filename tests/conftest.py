@@ -30,18 +30,23 @@ def sample_clean_df() -> pd.DataFrame:
 
 @pytest.fixture
 def sample_dirty_df() -> pd.DataFrame:
-    """DataFrame avec divers problèmes de qualité."""
+    """DataFrame avec divers problèmes de qualité (≥10 lignes pour AnomalyDetector)."""
     return pd.DataFrame({
-        "id": [1, 2, 2, 4, 5],  # Duplicates
-        "name": ["Alice", "Bob", None, "Diana", ""],  # Nulls et empty
-        "age": [25, 30, 35, 200, 28],  # Anomalie (200)
-        "salary": [50000, -5000, 55000, 70000, None],  # Négatif et null
+        "id": [1, 2, 2, 4, 5, 6, 7, 8, 9, 10],  # Duplicates (id=2 deux fois)
+        "name": ["Alice", "Bob", None, "Diana", "", "Frank", "Grace", None, "Ivan", "Julia"],  # Nulls et empty
+        "age": [25, 30, 35, 200, 28, 32, 45, 29, 31, -1],  # Anomalies (200, -1)
+        "salary": [50000, -5000, 55000, 70000, None, 65000, 80000, None, 45000, 75000],  # Négatif et nulls
         "email": [
             "alice@test.com",
             "invalid-email",  # Format invalide
             "charlie@test.com",
             "diana@test.com",
-            "eve@test.com"
+            "eve@test.com",
+            "frank@test.com",
+            "grace@test.com",
+            "henry@test.com",
+            "ivan@test.com",
+            "julia@test.com",
         ]
     })
 

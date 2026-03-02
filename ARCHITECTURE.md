@@ -150,7 +150,11 @@ elif task == "full":
 | Anomalies | Isolation Forest | contamination=0.1 |
 | Type mismatch | Tentative de conversion | N/A |
 | Drift | KS-test + PSI | p-value < 0.05 |
-| Constraints | RAG sur règles | Similarité > 0.5 |
+| Constraints (niveau 1) | Heuristique colonnes `*_id` | Doublon détecté |
+| Constraints (niveau 2) | RAG ChromaDB + règles métier | Similarité ≥ 0.55 |
+
+**Dégradation gracieuse** : si ChromaDB est indisponible, le niveau 1 reste actif.
+L'erreur est capturée dans `AgentContext.metadata["rules_validation_error"]`.
 
 **Output**: Liste de `QualityIssue` avec sévérité et confiance.
 
@@ -375,19 +379,20 @@ AnomalyDetector(
 
 ## Pistes d'amélioration
 
-### Court terme (v0.2)
+### Court terme (v0.2) — Livré ✅
 
-- [ ] Tests d'intégration complets
-- [ ] Persistance des sessions (Redis)
-- [ ] Support CSV/Parquet upload
-- [ ] Métriques Prometheus
+- [x] Tests d'intégration complets (97 tests, 100 % pass)
+- [x] Support CSV/Parquet upload (`POST /upload`, pyarrow)
+- [x] Métriques Prometheus (`GET /metrics`, prometheus-fastapi-instrumentator)
+- [x] Authentification JWT (`POST /auth/token`, opt-in `AUTH_ENABLED`)
+- [x] Persistance des sessions Redis (`GET /analyze/{session_id}`, fallback in-memory)
 
 ### Moyen terme (v0.3)
 
 - [ ] Interface web (Streamlit ou React)
-- [ ] Authentification JWT
-- [ ] Webhooks pour notifications
-- [ ] Parallélisation des agents indépendants
+- [ ] Webhooks pour notifications async
+- [ ] Parallélisation des agents indépendants (asyncio)
+- [ ] Rate limiting (slowapi)
 
 ### Long terme (v1.0)
 
@@ -413,4 +418,5 @@ AnomalyDetector(
 
 ---
 
-*Document généré pour DataSentinel AI v0.1.0*
+*Document mis à jour pour DataSentinel AI v0.1.1*
+*(v0.1.0 → v0.1.1 : 4 bugs corrigés, 66 tests unitaires et d'intégration ajoutés)*

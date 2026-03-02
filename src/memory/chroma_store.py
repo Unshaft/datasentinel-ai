@@ -14,7 +14,7 @@ ChromaDB est choisi pour:
 """
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -90,7 +90,7 @@ class ChromaStore:
             name=settings.chroma_rules_collection,
             metadata={
                 "description": "Business rules for data validation",
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
         )
 
@@ -99,7 +99,7 @@ class ChromaStore:
             name=settings.chroma_decisions_collection,
             metadata={
                 "description": "History of agent decisions",
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
         )
 
@@ -108,7 +108,7 @@ class ChromaStore:
             name=settings.chroma_feedback_collection,
             metadata={
                 "description": "User feedback on decisions",
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
         )
 
@@ -138,7 +138,7 @@ class ChromaStore:
         meta = metadata or {}
         meta.update({
             "rule_type": rule_type,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True
         })
 
@@ -179,9 +179,16 @@ class ChromaStore:
             where_filter["rule_type"] = rule_type
 
         try:
+            # ChromaDB lève une exception si la collection est vide.
+            if self.rules_collection.count() == 0:
+                return []
+
+            # n_results ne peut pas dépasser le nombre de documents présents.
+            actual_n = min(n_results, self.rules_collection.count())
+
             results = self.rules_collection.query(
                 query_texts=[query],
-                n_results=n_results,
+                n_results=actual_n,
                 where=where_filter,
                 include=["documents", "metadatas", "distances"]
             )
@@ -249,7 +256,7 @@ class ChromaStore:
         try:
             self.rules_collection.update(
                 ids=[rule_id],
-                metadatas=[{"active": False, "deactivated_at": datetime.utcnow().isoformat()}]
+                metadatas=[{"active": False, "deactivated_at": datetime.now(timezone.utc).isoformat()}]
             )
         except Exception as e:
             raise ChromaDBError(
@@ -289,13 +296,14 @@ class ChromaStore:
         # Créer un texte descriptif pour la recherche sémantique
         document = f"Agent: {agent_type}. Action: {action}. Reasoning: {reasoning}"
 
+        # ChromaDB n'accepte pas None comme valeur de métadonnée (str/int/float/bool
+        # uniquement). was_correct est omis ici et n'est ajouté qu'après feedback.
         metadata = {
             "agent_type": agent_type,
             "action": action,
             "confidence": confidence,
             "context_hash": hashlib.md5(str(context).encode()).hexdigest(),
-            "created_at": datetime.utcnow().isoformat(),
-            "was_correct": None,  # À remplir via feedback
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
         try:
@@ -339,9 +347,14 @@ class ChromaStore:
             where_filter["agent_type"] = agent_type
 
         try:
+            if self.decisions_collection.count() == 0:
+                return []
+
+            actual_n = min(n_results, self.decisions_collection.count())
+
             results = self.decisions_collection.query(
                 query_texts=[query],
-                n_results=n_results,
+                n_results=actual_n,
                 where=where_filter if where_filter else None,
                 include=["documents", "metadatas", "distances"]
             )
@@ -456,7 +469,7 @@ class ChromaStore:
             "target_id": target_id,
             "target_type": target_type,
             "is_correct": is_correct,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
         try:
@@ -490,7 +503,7 @@ class ChromaStore:
                 ids=[decision_id],
                 metadatas=[{
                     "was_correct": was_correct,
-                    "feedback_received_at": datetime.utcnow().isoformat()
+                    "feedback_received_at": datetime.now(timezone.utc).isoformat()
                 }]
             )
         except Exception:
@@ -540,9 +553,14 @@ class ChromaStore:
             Feedbacks similaires
         """
         try:
+            if self.feedback_collection.count() == 0:
+                return []
+
+            actual_n = min(n_results, self.feedback_collection.count())
+
             results = self.feedback_collection.query(
                 query_texts=[query],
-                n_results=n_results,
+                n_results=actual_n,
                 include=["documents", "metadatas", "distances"]
             )
 

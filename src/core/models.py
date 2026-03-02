@@ -11,7 +11,7 @@ Design Principles:
 - Sérialisation JSON native pour l'API
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -135,7 +135,7 @@ class DataProfile(BaseModel):
     dataset_id: str = Field(..., description="Identifiant unique du dataset")
     source: str = Field(..., description="Source du dataset (fichier, API, etc.)")
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         description="Date de création du profil"
     )
 
@@ -206,7 +206,7 @@ class QualityIssue(BaseModel):
     # Traçabilité
     detected_by: AgentType = Field(..., description="Agent ayant détecté le problème")
     detected_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         description="Date de détection"
     )
 
@@ -255,7 +255,7 @@ class CorrectionProposal(BaseModel):
         description="Agent ayant proposé la correction"
     )
     proposed_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         description="Date de proposition"
     )
 
@@ -310,7 +310,7 @@ class ValidationResult(BaseModel):
         description="Agent validateur"
     )
     validated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         description="Date de validation"
     )
 
@@ -386,7 +386,7 @@ class AgentDecision(BaseModel):
 
     # Traçabilité
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         description="Date de la décision"
     )
 
