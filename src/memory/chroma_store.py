@@ -213,6 +213,36 @@ class ChromaStore:
                 original_error=e
             )
 
+    def get_relevant_rules(
+        self,
+        col_name: str,
+        col_type: str,
+        sample_values: list[Any] | None = None,
+        top_k: int = 3,
+    ) -> list[dict[str, Any]]:
+        """
+        Retourne les règles pertinentes pour une colonne spécifique (Active RAG — F25).
+
+        Args:
+            col_name: Nom de la colonne
+            col_type: Type de la colonne (numeric, object, datetime, …)
+            sample_values: Quelques valeurs exemple pour enrichir la requête
+            top_k: Nombre de règles à retourner
+
+        Returns:
+            Liste de règles avec similarité, triées par pertinence
+        """
+        # Requête sémantique enrichie
+        samples_str = ""
+        if sample_values:
+            samples_str = f" values: {', '.join(str(v) for v in sample_values[:5])}"
+        query = f"{col_name} {col_type}{samples_str}"
+
+        try:
+            return self.search_rules(query, n_results=top_k)
+        except Exception:
+            return []
+
     def get_all_rules(self, rule_type: str | None = None) -> list[dict[str, Any]]:
         """
         Récupère toutes les règles actives.
@@ -236,10 +266,16 @@ class ChromaStore:
             rules = []
             if results["ids"]:
                 for i, rule_id in enumerate(results["ids"]):
+                    meta = results["metadatas"][i] or {}
                     rules.append({
                         "id": rule_id,
                         "text": results["documents"][i],
-                        "metadata": results["metadatas"][i]
+                        "metadata": meta,
+                        # Champs aplatis pour faciliter la sérialisation
+                        "rule_type": meta.get("rule_type", "constraint"),
+                        "severity": meta.get("severity", "medium"),
+                        "category": meta.get("category", "general"),
+                        "active": meta.get("active", True),
                     })
 
             return rules

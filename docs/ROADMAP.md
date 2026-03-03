@@ -5,7 +5,7 @@ Chaque section documente le **pourquoi**, le **comment** et les **critères de v
 
 ---
 
-## État actuel — v0.5.0
+## État actuel — v0.8.0
 
 | Composant | État | Notes |
 |-----------|------|-------|
@@ -29,6 +29,17 @@ Chaque section documente le **pourquoi**, le **comment** et les **critères de v
 | Application des corrections (`POST /analyze/{id}/apply-corrections`) | ✅ v0.5 | Applique les corrections auto, retourne CSV propre |
 | Persistance DataFrame en session (`save_dataframe` / `load_dataframe`) | ✅ v0.5 | Parquet base64 dans le store, même TTL que la session |
 | Analyse en lot (`POST /batch`) | ✅ v0.5 | Jusqu'à 10 fichiers CSV/Parquet en parallèle (asyncio.gather) |
+| Comparaison avant/après (`GET /analyze/{id}/comparison`) | ✅ v0.6 | Score delta + issues supprimées / restantes |
+| CRUD règles métier (`GET/POST/DELETE /rules`) | ✅ v0.6 | Gestion des règles ChromaDB via API + Streamlit |
+| Jobs asynchrones (`POST /jobs/analyze`) | ✅ v0.6 | Analyse non-bloquante pour gros fichiers (> 10k lignes) |
+| Tableau de bord analytique (`GET /stats`) | ✅ v0.6 | Compteurs agrégés persistés JSON, top issues, score moyen |
+| LLM Quality Check (Claude function calling) | ✅ v0.7 | Détection sémantique opt-in, fallback silencieux |
+| Orchestrateur adaptatif (ReAct loop) | ✅ v0.7 | Plan conditionnel selon profil, `reasoning_steps` exposé |
+| RAG actif dans la décision | ✅ v0.7 | Seuils dynamiques via ChromaDB, règles dans `issue.details` |
+| Feedback qui améliore le comportement | ✅ v0.7 | `confidence_adjustments` persistés, règles d'exception auto |
+| Classification sémantique LLM (`SemanticProfilerAgent`) | ✅ v0.8 | 1 appel batch Claude — classifie email/age/montant/etc. par colonne |
+| Validation sémantique QualityAgent | ✅ v0.8 | Règles métier auto selon semantic_type (négatifs, hors-plage) |
+| Export schéma sémantique (`GET /analyze/{id}/schema`) | ✅ v0.8 | JSON réutilisable avec inferred_type + semantic_type + pattern |
 
 ### Dette technique résolue en v0.4
 
@@ -521,6 +532,399 @@ fichier par fichier est lent et répétitif.
 
 ---
 
+## v0.6 — Features livrées
+
+> Thème : **Intelligibilité et pilotage** — rendre le système plus transparent,
+> gérable et observable sans toucher au code source.
+
+### Feature 19 — Comparaison avant/après corrections (`GET /analyze/{id}/comparison`)
+
+**Motivation** : après `POST /analyze/{id}/apply-corrections`, l'utilisateur veut
+mesurer concrètement l'amélioration : quel score avant, quel score après, quelles
+issues ont disparu. Actuellement il faut lancer manuellement une deuxième analyse.
+
+**Décision de design** :
+
+- L'endpoint charge le DataFrame corrigé depuis la session (stocké après apply-corrections
+  sous une clé `df_corrected:{session_id}`) ou applique les corrections à la volée depuis le DataFrame original.
+- Relance le pipeline Quality uniquement (pas de reprofilage complet) sur le DataFrame corrigé
+  → score_after + issues_after.
+- Retourne un objet de comparaison : `score_before`, `score_after`, `delta`, `issues_removed`,
+  `issues_remaining`, `columns_improved`.
+- Pas de persistance supplémentaire : stateless, calcul à la demande.
+
+**Fichiers à créer/modifier** :
+
+- `src/api/routes/analyze.py` — `GET /{session_id}/comparison`
+- `src/api/schemas/responses.py` — `ComparisonResponse` avec before/after/delta
+- `streamlit_app.py` — bouton "Voir l'amélioration" dans l'onglet Corrections
+- `tests/integration/test_comparison.py` — 6 tests
+
+**Critères de validation** :
+
+- [ ] Session valide + DataFrame disponible → HTTP 200, `score_after` ≥ `score_before`
+- [ ] `delta = score_after - score_before` (peut être 0 si aucune issue auto)
+- [ ] `issues_removed` liste les issue_types qui ont disparu
+- [ ] `issues_remaining` liste les issues persistantes
+- [ ] Session inconnue → HTTP 404
+- [ ] DataFrame non disponible → HTTP 422
+
+---
+
+### Feature 20 — CRUD règles métier (`GET/POST/DELETE /rules`)
+
+**Motivation** : les règles ChromaDB s'ajoutent actuellement en JSON ou via le champ
+`custom_rules` de `POST /analyze`. Il n'y a aucun moyen de les lister, les supprimer
+ou les modifier via l'API.
+
+**Décision de design** :
+
+- `GET /rules` → liste toutes les règles actives (id, texte, type, sévérité, catégorie)
+- `POST /rules` → ajoute une règle (même schéma qu'`AddRuleRequest`)
+- `DELETE /rules/{rule_id}` → supprime une règle par ID
+- La collection ChromaDB est la source de vérité (pas de base SQL supplémentaire)
+- Rate limit : 60 req/min sur GET, 20 req/min sur POST/DELETE (modificateurs)
+
+**Fichiers à créer/modifier** :
+
+- `src/api/routes/rules.py` — nouveau router `/rules`
+- `src/api/main.py` — `app.include_router(rules.router)`
+- `streamlit_app.py` — onglet "📋 Règles" avec formulaire CRUD
+- `tests/integration/test_rules.py` — 8 tests
+
+**Critères de validation** :
+
+- [ ] `GET /rules` → liste les règles (liste vide si aucune)
+- [ ] `POST /rules` avec texte valide → 201 Created, règle listée ensuite
+- [ ] `DELETE /rules/{id}` existant → 204 No Content
+- [ ] `DELETE /rules/{id}` inconnu → 404
+- [ ] Règle ajoutée via Streamlit → visible dans `GET /rules`
+- [ ] Règle supprimée → n'apparaît plus dans `GET /rules`
+- [ ] Règle active influence le résultat de `POST /analyze` (constraint_violation)
+
+---
+
+### Feature 21 — Jobs asynchrones pour gros fichiers (`POST /jobs/analyze`)
+
+**Motivation** : pour les fichiers > 50 000 lignes, l'analyse dépasse souvent le timeout
+HTTP de 30 s (Streamlit, proxies). Un système de jobs permet un traitement non-bloquant.
+
+**Décision de design** :
+
+- `POST /jobs/analyze` — accepte un fichier (comme `/upload`), retourne immédiatement
+  un `job_id` + statut `pending`.
+- Traitement via `asyncio.create_task` dans le même process (pas de Celery pour garder
+  le déploiement simple). Adapté pour des workloads < 500 k lignes ; pour plus, documenter
+  le passage à ARQ/Celery.
+- `GET /jobs/{job_id}` → `{status: pending|running|completed|failed, progress, result?}`
+- Le résultat final est stocké dans le session store sous `job:{job_id}` (TTL 2h).
+- Seuil de déclenchement asynchrone : configurable (`ASYNC_THRESHOLD_ROWS=10000` dans `.env`).
+
+**Fichiers à créer/modifier** :
+
+- `src/api/routes/jobs.py` — router `/jobs`
+- `src/core/config.py` — `async_threshold_rows: int = 10000`
+- `src/api/main.py` — `app.include_router(jobs.router)`
+- `streamlit_app.py` — polling du statut du job avec `st.status` + barre de progression
+- `tests/integration/test_jobs.py` — 6 tests
+
+**Critères de validation** :
+
+- [ ] `POST /jobs/analyze` → HTTP 202 Accepted, `job_id` + status=pending
+- [ ] `GET /jobs/{job_id}` immédiatement → status=pending ou running
+- [ ] `GET /jobs/{job_id}` après completion → status=completed, `result` présent
+- [ ] `GET /jobs/{unknown}` → HTTP 404
+- [ ] Fichier invalide → job passe en status=failed avec `error`
+- [ ] Streamlit affiche la progression et le résultat final
+
+---
+
+### Feature 22 — Tableau de bord analytique (`GET /stats`)
+
+**Motivation** : en production, on veut suivre l'activité du système : combien d'analyses
+lancées, quel score moyen, quels types d'issues sont les plus fréquents, tendance
+dans le temps.
+
+**Décision de design** :
+
+- `GET /stats` → agrège les métriques depuis le session store + un compteur en mémoire
+  (incrément à chaque analyse réussie, persisté en JSON comme les webhooks).
+- Métriques exposées : `total_sessions`, `avg_quality_score`, `top_issue_types` (top 5),
+  `sessions_by_day` (7 derniers jours), `score_distribution` (buckets 0-20/20-40/40-60/60-80/80-100).
+- Pas de base time-series (pas d'InfluxDB) : compteurs JSON simple dans `./data/stats.json`.
+- Réinitialisation via `DELETE /stats` (admin only quand `auth_enabled=True`).
+
+**Fichiers à créer/modifier** :
+
+- `src/core/stats_manager.py` — `StatsManager` avec `record_session()`, `get_stats()`, persistance JSON
+- `src/api/routes/stats.py` — `GET /stats`, `DELETE /stats`
+- `src/api/main.py` — `app.include_router(stats.router)`
+- `src/api/routes/analyze.py` + `upload.py` + `batch.py` — appel `stats_manager.record_session()` après pipeline
+- `streamlit_app.py` — onglet "📊 Stats" avec graphiques agrégés
+- `tests/unit/test_stats_manager.py` — 6 tests
+
+**Critères de validation** :
+
+- [ ] `GET /stats` après 0 analyse → `total_sessions=0`
+- [ ] `GET /stats` après 3 analyses → `total_sessions=3`, `avg_quality_score` cohérent
+- [ ] `top_issue_types` liste les 5 types les plus détectés
+- [ ] `score_distribution` somme à `total_sessions`
+- [ ] `DELETE /stats` remet les compteurs à zéro
+- [ ] Données persistées entre redémarrages (`./data/stats.json`)
+
+---
+
+## v0.7 — Features livrées
+
+> Thème : **Intelligence agentique réelle** — faire entrer le LLM dans la boucle
+> de décision, rendre l'orchestrateur adaptatif, activer le RAG sur les seuils,
+> et fermer la boucle feedback pour que le système s'améliore à chaque correction.
+>
+> C'est le passage de *"pipeline déterministe avec infrastructure agentique"*
+> à un *"vrai système agentique qui raisonne, s'adapte et apprend"*.
+
+---
+
+### Feature 23 — LLM Quality Check (Claude pour les cas ambigus)
+
+**Motivation** : les checks heuristiques actuels (regex, pandas, IQR) ne couvrent pas
+les anomalies sémantiques — une valeur texte syntaxiquement valide mais métier incohérente
+(ex: `age=250`, `pays="Marteau"`, `email="directeur"` sans `@`). Seul un LLM comprend
+le sens des données.
+
+**Décision de design** :
+
+- Nouveau check `_detect_semantic_anomalies_llm()` dans `QualityAgent`, déclenché pour
+  les colonnes `object` non couvertes par les checks heuristiques ET si `ENABLE_LLM_CHECKS=true`.
+- Pattern exact : sample 20 valeurs → appel Claude via function calling →
+  le modèle appelle `flag_anomaly(value, reason, severity)` pour chaque anomalie détectée.
+- Opt-in strict : `ENABLE_LLM_CHECKS=false` par défaut → zéro régression sur les 188 tests existants.
+  En prod, `ENABLE_LLM_CHECKS=true` dans `.env` + `ANTHROPIC_API_KEY` configuré.
+- Garde-fous : timeout 10s, max 1 appel LLM par colonne, max 5 colonnes par analyse,
+  fallback silencieux si API indisponible (le check est simplement ignoré, pas d'exception).
+- `detected_by=AgentType.QUALITY`, `confidence` = score retourné par le LLM (0.6–0.95),
+  `details={"detection_method": "llm", "model": "claude-haiku-4-5"}`.
+- Le modèle utilisé est `claude-haiku-4-5` (rapide, économique) sauf override `LLM_CHECK_MODEL`.
+
+**Prompt pattern** :
+
+```text
+Tu analyses la colonne "{col_name}" (type: {dtype}, contexte: {col_context}).
+Identifie les valeurs sémantiquement anormales ou métier-incohérentes.
+Valeurs : {sample_values}
+Pour chaque anomalie, appelle flag_anomaly() avec la valeur, la raison et la sévérité.
+Ne signale que les vrais problèmes (confiance > 0.7). Ignore les valeurs normales.
+```
+
+**Fichiers à créer/modifier** :
+
+- `src/agents/quality.py` — `_detect_semantic_anomalies_llm()`, tool `flag_anomaly`
+- `src/core/config.py` — `enable_llm_checks: bool = False`, `llm_check_model: str = "claude-haiku-4-5-20251001"`
+- `tests/unit/test_quality_v7.py` — 6 tests (mock de l'appel LLM via `unittest.mock`)
+
+**Critères de validation** :
+
+- [ ] `ENABLE_LLM_CHECKS=false` → aucun appel API, comportement identique à v0.6
+- [ ] `ENABLE_LLM_CHECKS=true` + mock LLM → issues détectées avec `detected_by=QUALITY`
+- [ ] API LLM indisponible (mock exception) → fallback silencieux, pipeline continue
+- [ ] Timeout dépassé → fallback silencieux, pas de crash
+- [ ] `confidence` retournée par le LLM propagée dans l'issue
+- [ ] Max 5 colonnes traitées par analyse (protection coût)
+
+---
+
+### Feature 24 — Orchestrateur adaptatif (ReAct loop)
+
+**Motivation** : l'orchestrateur actuel est un pipeline linéaire fixe :
+Profiler → Quality → Corrector → Validator, toujours dans cet ordre, toujours tous les checks.
+Un vrai orchestrateur agentique observe les résultats intermédiaires et adapte son plan.
+
+**Décision de design** :
+
+- Nouveau `run_pipeline_adaptive()` dans `OrchestratorAgent`, basé sur le pattern ReAct
+  (Reason → Act → Observe → Repeat).
+- **Phase 1 — Observe** : Profiler s'exécute, résultat dans le contexte.
+- **Phase 2 — Reason** : l'orchestrateur analyse le profil et construit un plan :
+
+  | Condition observée | Action adaptée |
+  | --- | --- |
+  | `row_count < 30` | Skip `AnomalyDetector` (Isolation Forest instable) |
+  | `total_null_count == 0` | Skip check `MISSING_VALUES` |
+  | `null_percentage > 50%` sur toutes colonnes | Skip checks format (inutile sur colonnes vides) |
+  | `column_count > 100` | Mode sampling : top 20 colonnes par `null_count` |
+  | Aucune colonne numérique | Skip outlier + drift detection |
+  | Colonne temporelle détectée | Active `DriftDetector` sur ces colonnes |
+
+- **Phase 3 — Act** : exécute uniquement les checks du plan (via `asyncio.gather` sélectif).
+- **Phase 4 — Observe** : si un check lève un `CRITICAL`, re-raisonne : faut-il relancer
+  un check complémentaire ?
+- Le `reasoning_log` (liste de `{step, thought, action, observation}`) est stocké dans
+  `context.metadata["reasoning_steps"]` et exposé dans `AnalyzeResponse` si
+  `include_reasoning=true` dans la requête.
+- `run_pipeline_async()` reste inchangé (rétrocompatibilité — les endpoints existants
+  n'utilisent pas encore le mode adaptatif).
+
+**Fichiers à créer/modifier** :
+
+- `src/agents/orchestrator.py` — `run_pipeline_adaptive()`, `_build_execution_plan()`, `_observe_and_replan()`
+- `src/api/schemas/requests.py` — `include_reasoning: bool = False` dans `AnalyzeRequest`
+- `src/api/schemas/responses.py` — `reasoning_steps: list[dict] = []` dans `AnalyzeResponse`
+- `src/api/routes/analyze.py` — passe `include_reasoning` au pipeline
+- `tests/unit/test_orchestrator_v7.py` — 8 tests
+
+**Critères de validation** :
+
+- [ ] Dataset avec `row_count < 30` → `reasoning_steps` contient "skip AnomalyDetector"
+- [ ] Dataset sans nulls → check MISSING_VALUES non lancé
+- [ ] Dataset > 100 colonnes → seules les 20 colonnes les plus dégradées analysées
+- [ ] Dataset avec colonne date → DriftDetector activé automatiquement
+- [ ] `include_reasoning=false` → `reasoning_steps=[]` (pas de surcoût)
+- [ ] Plan adaptatif ≡ résultats cohérents avec le plan fixe sur datasets standard (pas de régression)
+- [ ] Un check CRITICAL → re-raisonnement loggé dans `reasoning_steps`
+
+---
+
+### Feature 25 — RAG actif dans la boucle de décision
+
+**Motivation** : ChromaDB stocke des règles métier mais elles ne sont consultées qu'au
+moment du `ValidatorAgent`, après que les issues ont déjà été générées. Le RAG doit
+intervenir *avant* chaque check pour ajuster les seuils — une règle "email obligatoire"
+doit rendre la sévérité CRITICAL dès 1% de nulls, pas MEDIUM à 10%.
+
+**Décision de design** :
+
+- Nouveau `ChromaStore.get_relevant_rules(col_name, col_type, sample_values, top_k=3)` :
+  query par similarité sur le nom de colonne + type → retourne les règles les plus proches.
+- `RuleContext` dataclass dans `src/core/models.py` :
+
+  ```python
+  @dataclass
+  class RuleContext:
+      rules: list[str]          # textes des règles matchées
+      null_threshold_override: float | None    # None = seuils par défaut
+      severity_override: Severity | None
+      format_tolerance_override: float | None  # None = 5%
+  ```
+
+- Avant chaque check colonne dans `QualityAgent`, appel `_get_rule_context(col_name)` :
+  parse les règles retournées et extrait les overrides via keywords :
+  - "obligatoire" / "required" / "non null" → `null_threshold_override = 0.01`
+  - "identifiant unique" / "clé primaire" → `severity_override = CRITICAL` pour DUPLICATE
+  - "format strict" → `format_tolerance_override = 0.0`
+  - "optionnel" / "nullable" → `null_threshold_override = 0.8`
+- Les règles actives sont loggées dans `issue.details["applied_rules"]`.
+- Le `ValidatorAgent` utilise le RAG pour détecter les `CONSTRAINT_VIOLATION` :
+  query ChromaDB avec le profil de la colonne → si une règle matchée est violée → issue.
+
+**Fichiers à créer/modifier** :
+
+- `src/memory/chroma_store.py` — `get_relevant_rules(col_name, col_type, sample_values)`
+- `src/core/models.py` — `RuleContext` dataclass
+- `src/agents/quality.py` — `_get_rule_context()`, integration dans chaque check
+- `src/agents/validator.py` — RAG-based constraint violation detection
+- `tests/unit/test_rag_active.py` — 7 tests
+
+**Critères de validation** :
+
+- [ ] Règle "email obligatoire" dans ChromaDB → colonne `email` avec 5% nulls → CRITICAL (pas MEDIUM)
+- [ ] Règle "identifiant unique" → doublon → CRITICAL (pas LOW/MEDIUM)
+- [ ] Colonne sans règle correspondante → seuils par défaut inchangés
+- [ ] `issue.details["applied_rules"]` liste les règles qui ont influencé la détection
+- [ ] RAG query échoue → fallback sur seuils par défaut, pas d'exception
+- [ ] Performance : query ChromaDB < 50ms (index vectoriel, pas de scan full)
+
+---
+
+### Feature 26 — Feedback qui améliore le comportement
+
+**Motivation** : `POST /feedback` enregistre les retours mais ne modifie rien.
+C'est une boîte noire. Un système agentique apprend : un faux positif répété
+doit baisser la sensibilité du check concerné ; une correction confirmée doit
+enrichir les règles pour les analyses futures.
+
+**Décision de design** :
+
+- `FeedbackProcessor` dans `src/core/feedback_processor.py`, appelé depuis `POST /feedback`
+  après persistance du feedback dans ChromaDB.
+- **`was_correct=False` (fausse alerte)** :
+  1. Écrit une règle d'exception dans ChromaDB :
+     `"Colonne '{col}' : la valeur '{sample}' est normale, ne pas signaler comme {issue_type}"`
+  2. Incrémente `false_positive_stats[check_type]` dans `./data/feedback_stats.json`
+  3. Si `false_positive_stats[check_type] > 5` → `confidence_adjustments[check_type] -= 0.05`
+     (plancher à 0.5 — le check ne disparaît jamais, devient juste moins affirmatif)
+- **`was_correct=True` (confirmation)** :
+  1. `confidence_adjustments[check_type] += 0.02` (plafonné à 0.99)
+  2. Renforce la règle si une règle ChromaDB est liée au check
+- **`was_correct=None` + `correction=custom_value`** :
+  1. Ajoute l'exemple comme règle positive : `"Dans colonne '{col}', la valeur correcte est '{correction}'"`
+  2. Enrichit ChromaDB pour les prochaines validations RAG
+- `confidence_adjustments` chargés au démarrage de `QualityAgent` depuis `./data/feedback_stats.json`
+  → les seuils de confiance deviennent dynamiques entre les redémarrages.
+- `GET /stats` expose `feedback_summary` : `{false_positives_corrected, confirmations, examples_added, checks_adjusted}`.
+
+**Fichiers à créer/modifier** :
+
+- `src/core/feedback_processor.py` — `FeedbackProcessor` avec `process()`, `_update_confidence()`, `_write_exception_rule()`
+- `src/agents/quality.py` — `_load_confidence_adjustments()` au `__init__`, utilisation dans les seuils
+- `src/api/routes/feedback.py` — appelle `FeedbackProcessor.process()` après persistance
+- `./data/feedback_stats.json` — fichier de persistance des ajustements (créé automatiquement)
+- `tests/unit/test_feedback_processor.py` — 8 tests
+
+**Critères de validation** :
+
+- [ ] Feedback `was_correct=False` sur `MISSING_VALUES` × 6 → `confidence_adjustments["missing_values"]` baisse de 0.30
+- [ ] Feedback `was_correct=True` × 3 → `confidence_adjustments["missing_values"]` remonte de 0.06
+- [ ] Règle d'exception écrite dans ChromaDB après fausse alerte
+- [ ] `confidence_adjustments` persistés dans `feedback_stats.json`
+- [ ] `QualityAgent` chargé après feedbacks → seuils mis à jour (pas les seuils hardcodés)
+- [ ] Plancher à 0.5 et plafond à 0.99 respectés
+- [ ] `GET /stats` retourne `feedback_summary` cohérent
+- [ ] Feedback `correction=custom_value` → règle positive dans ChromaDB
+
+---
+
+### Architecture v0.7 — Vue d'ensemble de la boucle intelligente
+
+```text
+POST /upload → DataFrame
+       │
+       ▼
+ OrchestratorAgent.run_pipeline_adaptive()
+       │
+       ├─ [Observe] ProfilerAgent → DataProfile
+       │
+       ├─ [Reason]  _build_execution_plan(profile)
+       │            → skip inutiles, active LLM si ENABLE_LLM_CHECKS
+       │
+       ├─ [Act]     QualityAgent (checks sélectifs en parallèle)
+       │            │
+       │            ├─ _get_rule_context(col) → ChromaDB RAG query
+       │            │   → seuils dynamiques selon règles métier
+       │            │
+       │            ├─ checks heuristiques (nulls, formats, doublons…)
+       │            │
+       │            └─ _detect_semantic_anomalies_llm() [si activé]
+       │                → Claude function calling → issues sémantiques
+       │
+       ├─ [Observe] Issues collectées → si CRITICAL → re-plan ?
+       │
+       ├─ [Act]     CorrectorAgent → propositions
+       │
+       └─ [Act]     ValidatorAgent (RAG-based constraint check)
+                    → ChromaDB query → violations détectées
+
+POST /feedback → FeedbackProcessor
+       │
+       ├─ Fausse alerte → règle d'exception ChromaDB + confidence_adjustments--
+       ├─ Confirmation  → confidence_adjustments++
+       └─ Correction    → règle positive ChromaDB
+              │
+              └─ [Prochain démarrage] QualityAgent charge confidence_adjustments
+                 → seuils dynamiques, système qui apprend
+```
+
+---
+
 ## Processus de développement
 
 ### Définition of Done (DoD)
@@ -545,3 +949,6 @@ Une feature est **terminée** si :
 | v0.3.0 | 2026-03 | Parallélisation Quality (asyncio), rate limiting, webhooks, PDF, Streamlit — 120/120 tests |
 | v0.4.0 | 2026-03 | Q1 doublons, Q2 pseudo-nulls, Q3 formats, Q4 score/colonne, corrections JSON, Excel, persistance webhooks, dette technique — 166/166 tests |
 | v0.5.0 | 2026-03 | Apply-corrections (CSV propre), persistance DataFrame (parquet/base64), batch API (10 fichiers en parallèle), Streamlit v0.5 — 188/188 tests |
+| v0.6.0 | 2026-03 | Comparison before/after (F19), CRUD /rules (F20), async jobs (F21), dashboard stats (F22), Streamlit v0.6 — 210+ tests |
+| v0.7.0 | 2026-03 | LLM Quality Check opt-in (F23), orchestrateur adaptatif ReAct (F24), RAG actif seuils dynamiques (F25), feedback qui apprend (F26), Streamlit v0.7 — 275/275 tests |
+| v0.8.0 | 2026-03 | SemanticProfilerAgent batch LLM (F27), validation sémantique QualityAgent (F28), export schéma GET /schema (F29), onglet Schéma Streamlit — 300+ tests |

@@ -205,6 +205,18 @@ class Settings(BaseSettings):
         description="Durée de vie des sessions en secondes (défaut 1h)"
     )
 
+    # ===================
+    # LLM Quality Checks (v0.7)
+    # ===================
+    enable_llm_checks: bool = Field(
+        default=False,
+        description="Activer les vérifications sémantiques via LLM (opt-in)"
+    )
+    llm_check_model: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description="Modèle Claude pour les vérifications LLM (fast/cheap)"
+    )
+
     @field_validator("chroma_persist_path", mode="before")
     @classmethod
     def validate_path(cls, v: str | Path) -> Path:

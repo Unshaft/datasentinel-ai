@@ -23,6 +23,7 @@ from src.api.schemas.responses import (
 from src.core.config import settings
 from src.core.exceptions import DataSentinelError
 from src.core.models import AgentContext
+from src.core.stats_manager import get_stats_manager
 from src.core.webhook_manager import fire_webhooks
 from src.memory.session_store import get_session_store
 
@@ -246,6 +247,7 @@ async def upload_and_analyze(
         issues=_format_issues(context.issues),
         issues_by_severity=issues_by_severity,
         column_scores=context.metadata.get("column_scores", {}),
+        semantic_types=context.metadata.get("semantic_types") or None,
         needs_human_review=context.metadata.get("needs_human_review", False),
         escalation_reasons=escalation_reasons,
     )
@@ -255,6 +257,16 @@ async def upload_and_analyze(
         store = get_session_store()
         store.save(context.session_id, context)
         store.save_dataframe(context.session_id, df)
+    except Exception:
+        pass
+
+    # Stats (best-effort)
+    try:
+        issue_types = [iss.issue_type.value for iss in context.issues]
+        get_stats_manager().record_session(
+            context.metadata.get("quality_score", 100),
+            issue_types,
+        )
     except Exception:
         pass
 

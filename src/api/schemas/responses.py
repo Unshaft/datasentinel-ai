@@ -12,6 +12,42 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 # =============================================================================
+# SEMANTIC SCHEMA (v0.8 — F27/F29)
+# =============================================================================
+
+
+class SemanticColumnInfo(BaseModel):
+    """Classification sémantique d'une colonne (F27/F29 — v0.8)."""
+
+    name: str
+    dtype: str
+    inferred_type: str                  # Type technique du ProfilingAgent
+    semantic_type: str | None = None    # Type métier du SemanticProfilerAgent
+    confidence: float | None = None     # Confiance LLM (0.0-1.0)
+    language: str | None = None         # Langue détectée ("fr", "en", ...)
+    pattern: str | None = None          # Regex détectée si applicable
+    notes: str | None = None            # Observations LLM
+    null_percentage: float = 0.0
+    unique_count: int = 0
+    sample_values: list[Any] = Field(default_factory=list)
+
+
+class SchemaResponse(BaseModel):
+    """Export du schéma sémantique d'un dataset analysé (F29 — v0.8)."""
+
+    session_id: str
+    dataset_id: str
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    columns: list[SemanticColumnInfo] = Field(default_factory=list)
+    semantic_coverage: float = Field(
+        default=0.0,
+        ge=0,
+        le=100,
+        description="% de colonnes avec un type sémantique LLM (0-100)"
+    )
+
+
+# =============================================================================
 # MODÈLES DE BASE
 # =============================================================================
 
@@ -125,6 +161,12 @@ class AnalyzeResponse(BaseModel):
     column_scores: dict[str, float] = Field(
         default_factory=dict,
         description="Score de qualité individuel par colonne (0-100)"
+    )
+
+    # Types sémantiques LLM (v0.8 — F27, présent si ENABLE_LLM_CHECKS=true)
+    semantic_types: dict[str, Any] | None = Field(
+        default=None,
+        description="Classification sémantique des colonnes (opt-in LLM)"
     )
 
     # Escalade
@@ -307,3 +349,89 @@ class BatchAnalyzeResponse(BaseModel):
     succeeded: int = Field(..., description="Analyses réussies")
     failed: int = Field(..., description="Analyses en erreur")
     results: list[BatchResultItem] = Field(default_factory=list)
+
+
+# =============================================================================
+# COMPARISON (v0.6 — F19)
+# =============================================================================
+
+
+class ComparisonResponse(BaseModel):
+    """Résultat de comparaison avant/après corrections."""
+
+    session_id: str
+    score_before: float = Field(..., ge=0, le=100)
+    score_after: float = Field(..., ge=0, le=100)
+    delta: float = Field(..., description="Amélioration du score (peut être 0)")
+    issues_removed: list[str] = Field(
+        default_factory=list,
+        description="Types de problèmes disparus après corrections"
+    )
+    issues_remaining: list[str] = Field(
+        default_factory=list,
+        description="Types de problèmes persistants"
+    )
+    columns_improved: list[str] = Field(
+        default_factory=list,
+        description="Colonnes avec score amélioré"
+    )
+
+
+# =============================================================================
+# RULES (v0.6 — F20)
+# =============================================================================
+
+
+class RuleListResponse(BaseModel):
+    """Liste de règles métier."""
+
+    status: str = "success"
+    count: int
+    rules: list[RuleResponse] = Field(default_factory=list)
+
+
+class RuleCreateResponse(BaseModel):
+    """Confirmation de création d'une règle."""
+
+    status: str = "created"
+    rule: RuleResponse
+
+
+# =============================================================================
+# ASYNC JOBS (v0.6 — F21)
+# =============================================================================
+
+
+class JobCreateResponse(BaseModel):
+    """Réponse à la création d'un job asynchrone."""
+
+    job_id: str
+    status: str = "pending"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class JobStatusResponse(BaseModel):
+    """Statut d'un job asynchrone."""
+
+    job_id: str
+    status: str = Field(..., description="pending | running | completed | failed")
+    progress: float = Field(default=0.0, ge=0, le=100)
+    result: "AnalyzeResponse | None" = None
+    error: str | None = None
+    created_at: datetime | None = None
+
+
+# =============================================================================
+# STATS (v0.6 — F22)
+# =============================================================================
+
+
+class StatsResponse(BaseModel):
+    """Dashboard analytique agrégé."""
+
+    total_sessions: int = 0
+    avg_quality_score: float = 0.0
+    top_issue_types: dict[str, int] = Field(default_factory=dict)
+    sessions_by_day: dict[str, int] = Field(default_factory=dict)
+    score_distribution: dict[str, int] = Field(default_factory=dict)
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -10,6 +10,7 @@ Ce module configure et lance l'application FastAPI avec:
 """
 
 import json
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -25,11 +26,17 @@ from src.api.auth import get_current_user
 from src.api.limiter import limiter
 from src.api.routes import analyze, batch, explain, feedback, recommend, upload
 from src.api.routes import auth as auth_router
+from src.api.routes import jobs as jobs_router
+from src.api.routes import rules as rules_router
+from src.api.routes import stats as stats_router
 from src.api.routes import webhooks as webhooks_router
 from src.api.schemas.responses import ErrorResponse, HealthResponse
 from src.core.config import settings
 from src.core.exceptions import DataSentinelError
 from src.memory.chroma_store import get_chroma_store
+from src.utils.logging import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -45,26 +52,31 @@ async def lifespan(app: FastAPI):
     - Nettoyage des ressources
     """
     # === STARTUP ===
-    print("🚀 Démarrage de DataSentinel AI...")
+    setup_logging()
+    logger.info("Démarrage de DataSentinel AI...")
+
+    # Créer le dossier data/ si nécessaire (stats, webhooks, feedback)
+    from pathlib import Path
+    Path("data").mkdir(exist_ok=True)
 
     # Initialiser ChromaDB
     try:
         store = get_chroma_store()
-        print(f"✅ ChromaDB initialisé: {store.get_stats()}")
+        logger.info("ChromaDB initialisé: %s", store.get_stats())
 
         # Charger les règles par défaut si collection vide
         if store.rules_collection.count() == 0:
             await _load_default_rules(store)
 
     except Exception as e:
-        print(f"⚠️ Erreur initialisation ChromaDB: {e}")
+        logger.warning("Erreur initialisation ChromaDB: %s", e)
 
-    print("✅ DataSentinel AI prêt!")
+    logger.info("DataSentinel AI prêt!")
 
     yield
 
     # === SHUTDOWN ===
-    print("👋 Arrêt de DataSentinel AI...")
+    logger.info("Arrêt de DataSentinel AI...")
 
 
 async def _load_default_rules(store):
@@ -119,7 +131,7 @@ Le système utilise 4 agents spécialisés coordonnés par un orchestrateur:
 - ChromaDB pour le RAG et la mémoire
 - Scikit-learn pour la détection d'anomalies
     """,
-    version="0.5.0",
+    version="0.6.0",
     contact={
         "name": "DataSentinel Team",
     },
@@ -196,7 +208,10 @@ app.include_router(recommend.router, dependencies=_auth_dep)
 app.include_router(explain.router,   dependencies=_auth_dep)
 app.include_router(feedback.router,  dependencies=_auth_dep)
 app.include_router(upload.router,    dependencies=_auth_dep)
-app.include_router(batch.router,     dependencies=_auth_dep)
+app.include_router(batch.router,       dependencies=_auth_dep)
+app.include_router(rules_router.router, dependencies=_auth_dep)
+app.include_router(jobs_router.router,  dependencies=_auth_dep)
+app.include_router(stats_router.router, dependencies=_auth_dep)
 # Auth router : pas de protection (c'est le endpoint de login)
 app.include_router(auth_router.router)
 # Webhooks : pas de protection (enregistrement public)

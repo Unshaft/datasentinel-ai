@@ -25,12 +25,16 @@ from src.api.schemas.requests import AnalyzeRequest
 from src.api.schemas.responses import (
     AnalyzeResponse,
     ColumnProfileResponse,
+    ComparisonResponse,
     DataProfileResponse,
     ErrorResponse,
     IssueResponse,
+    SchemaResponse,
+    SemanticColumnInfo,
 )
 from src.core.exceptions import DataSentinelError
 from src.core.models import AgentContext
+from src.core.stats_manager import get_stats_manager
 from src.core.webhook_manager import fire_webhooks
 from src.memory.session_store import get_session_store
 
@@ -181,12 +185,19 @@ async def analyze_dataset(
                     rule_type="custom"
                 )
 
-        # Pipeline async — quality checks en parallèle
-        context = await orchestrator.run_pipeline_async(
-            context, df,
-            task_type=TaskType.ANALYZE,
-            **options
-        )
+        # Pipeline : adaptatif (ReAct) si include_reasoning, sinon async standard
+        if body.include_reasoning:
+            context = await orchestrator.run_pipeline_adaptive(
+                context, df,
+                task_type=TaskType.ANALYZE,
+                **options
+            )
+        else:
+            context = await orchestrator.run_pipeline_async(
+                context, df,
+                task_type=TaskType.ANALYZE,
+                **options
+            )
 
         issues_by_severity: dict[str, int] = {}
         for issue in context.issues:
@@ -215,6 +226,7 @@ async def analyze_dataset(
             issues=_format_issues(context.issues),
             issues_by_severity=issues_by_severity,
             column_scores=context.metadata.get("column_scores", {}),
+            semantic_types=context.metadata.get("semantic_types") or None,
             needs_human_review=context.metadata.get("needs_human_review", False),
             escalation_reasons=escalation_reasons
         )
@@ -224,6 +236,16 @@ async def analyze_dataset(
             store = get_session_store()
             store.save(context.session_id, context)
             store.save_dataframe(context.session_id, df)
+        except Exception:
+            pass
+
+        # Stats (best-effort)
+        try:
+            issue_types = [iss.issue_type.value for iss in context.issues]
+            get_stats_manager().record_session(
+                context.metadata.get("quality_score", 100),
+                issue_types,
+            )
         except Exception:
             pass
 
@@ -295,6 +317,7 @@ async def get_analysis_results(session_id: str) -> AnalyzeResponse:
         issues=_format_issues(context.issues),
         issues_by_severity=issues_by_severity,
         column_scores=context.metadata.get("column_scores", {}),
+        semantic_types=context.metadata.get("semantic_types") or None,
         needs_human_review=context.metadata.get("needs_human_review", False),
         escalation_reasons=[]
     )
@@ -597,6 +620,212 @@ async def apply_corrections(session_id: str) -> StreamingResponse:
             "X-Rows-After": str(len(df)),
             "X-Corrections-Count": str(len(corrections)),
         },
+    )
+
+
+# =============================================================================
+# GET /analyze/{session_id}/comparison  — Comparison avant/après (v0.6 — F19)
+# =============================================================================
+
+@router.get(
+    "/{session_id}/comparison",
+    response_model=ComparisonResponse,
+    summary="Comparer la qualité avant/après corrections",
+    description="""
+    Applique les corrections automatiques en mémoire et mesure l'impact
+    sur le score de qualité, sans modifier les données persistées.
+
+    Nécessite que le DataFrame original soit disponible en session
+    (créé via POST /upload ou POST /analyze avec des données).
+    """,
+    responses={
+        404: {"model": ErrorResponse, "description": "Session non trouvée"},
+        422: {"model": ErrorResponse, "description": "Données originales expirées"},
+    },
+)
+async def get_comparison(session_id: str) -> ComparisonResponse:
+    """Compare les scores de qualité avant et après corrections automatiques."""
+    from src.agents.quality import QualityAgent
+    from src.core.models import AgentContext as Ctx, IssueType
+
+    store = get_session_store()
+    context = store.load(session_id)
+    if context is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' introuvable ou expirée.",
+        )
+
+    df_orig = store.load_dataframe(session_id)
+    if df_orig is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Données originales non disponibles. "
+                "Relancez l'analyse via POST /upload."
+            ),
+        )
+
+    score_before: float = context.metadata.get("quality_score", 100)
+    issues_before = {iss.issue_type.value for iss in context.issues}
+
+    # Applique les mêmes corrections qu'apply-corrections
+    df_corrected = df_orig.copy()
+
+    if any(iss.issue_type == IssueType.DUPLICATE for iss in context.issues):
+        df_corrected = df_corrected.drop_duplicates(keep="first")
+
+    processed: set[str] = set()
+    for issue in context.issues:
+        col = issue.column
+        if col is None or col not in df_corrected.columns or col in processed:
+            continue
+        if issue.issue_type == IssueType.MISSING_VALUES:
+            mask = df_corrected[col].astype(str).str.lower().str.strip().isin(_PSEUDO_NULL_TOKENS)
+            if mask.any():
+                df_corrected.loc[mask, col] = pd.NA
+            if pd.api.types.is_numeric_dtype(df_corrected[col]):
+                m = df_corrected[col].median()
+                if pd.notna(m):
+                    df_corrected[col] = df_corrected[col].fillna(m)
+            else:
+                mv = df_corrected[col].dropna().mode()
+                if not mv.empty:
+                    df_corrected[col] = df_corrected[col].fillna(mv.iloc[0])
+            processed.add(col)
+        elif issue.issue_type == IssueType.FORMAT_ERROR:
+            df_corrected[col] = df_corrected[col].astype(str).str.strip()
+            processed.add(col)
+        elif issue.issue_type == IssueType.TYPE_MISMATCH:
+            num = pd.to_numeric(df_corrected[col], errors="coerce")
+            if num.notna().sum() / max(len(df_corrected), 1) >= 0.9:
+                df_corrected[col] = num
+            processed.add(col)
+
+    # Re-run quality uniquement sur le df corrigé
+    try:
+        quality_agent = QualityAgent()
+        ctx_copy = Ctx(
+            session_id=f"cmp_{session_id}",
+            dataset_id=context.dataset_id,
+        )
+        ctx_copy.profile = context.profile
+        ctx_copy = quality_agent.execute(
+            ctx_copy, df_corrected, detect_anomalies=False, detect_drift=False
+        )
+
+        # Calcul du score après
+        from src.agents.orchestrator import OrchestratorAgent
+        orch = OrchestratorAgent()
+        score_after = orch._calculate_quality_score(ctx_copy)
+    except Exception:
+        # Fallback : estimation basique
+        auto_types = {IssueType.DUPLICATE, IssueType.MISSING_VALUES,
+                      IssueType.FORMAT_ERROR, IssueType.TYPE_MISMATCH}
+        auto_fixed = [i for i in context.issues if i.issue_type in auto_types]
+        bonus = sum(
+            {"critical": 15, "high": 10, "medium": 5, "low": 2}.get(i.severity.value, 0)
+            for i in auto_fixed
+        )
+        score_after = min(100.0, score_before + bonus)
+        ctx_copy = Ctx(session_id=f"cmp_{session_id}", dataset_id=context.dataset_id)
+
+    issues_after = {iss.issue_type.value for iss in ctx_copy.issues}
+    issues_removed = sorted(issues_before - issues_after)
+    issues_remaining = sorted(issues_before & issues_after)
+
+    # Colonnes dont le score a augmenté
+    col_scores_before: dict[str, float] = context.metadata.get("column_scores", {})
+    col_scores_after: dict[str, float] = ctx_copy.metadata.get("column_scores", {})
+    columns_improved = [
+        col for col in col_scores_before
+        if col_scores_after.get(col, col_scores_before[col]) > col_scores_before[col]
+    ]
+
+    return ComparisonResponse(
+        session_id=session_id,
+        score_before=round(score_before, 2),
+        score_after=round(score_after, 2),
+        delta=round(score_after - score_before, 2),
+        issues_removed=issues_removed,
+        issues_remaining=issues_remaining,
+        columns_improved=columns_improved,
+    )
+
+
+# =============================================================================
+# GET /analyze/{session_id}/schema  — Export schéma sémantique (v0.8 — F29)
+# =============================================================================
+
+@router.get(
+    "/{session_id}/schema",
+    response_model=SchemaResponse,
+    summary="Exporter le schéma sémantique détecté",
+    description="""
+    Retourne le schéma sémantique du dataset analysé.
+
+    Fusionne le profil technique (types pandas) et les types sémantiques LLM
+    (disponibles si ENABLE_LLM_CHECKS=true au moment de l'analyse).
+
+    - `inferred_type` : type technique détecté par le ProfilingAgent
+    - `semantic_type` : nature métier détectée par le SemanticProfilerAgent (LLM)
+    - `confidence` : confiance du LLM sur la classification sémantique
+    """,
+    responses={
+        404: {"model": ErrorResponse, "description": "Session non trouvée"},
+    },
+)
+async def get_schema(session_id: str) -> SchemaResponse:
+    """Retourne le schéma sémantique d'une session analysée."""
+    context = get_session_store().load(session_id)
+    if context is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' introuvable ou expirée.",
+        )
+
+    semantic_types: dict = context.metadata.get("semantic_types", {})
+    col_infos: list[SemanticColumnInfo] = []
+
+    if context.profile:
+        for col in context.profile.columns:
+            sem = semantic_types.get(col.name, {})
+            col_infos.append(SemanticColumnInfo(
+                name=col.name,
+                dtype=col.dtype,
+                inferred_type=col.inferred_type,
+                semantic_type=sem.get("semantic_type"),
+                confidence=sem.get("confidence"),
+                language=sem.get("language"),
+                pattern=sem.get("pattern"),
+                notes=sem.get("notes"),
+                null_percentage=col.null_percentage,
+                unique_count=col.unique_count,
+                sample_values=col.sample_values[:5],
+            ))
+    else:
+        # Pas de profil → colonnes vides avec semantic_types si disponibles
+        for col_name, sem in semantic_types.items():
+            col_infos.append(SemanticColumnInfo(
+                name=col_name,
+                dtype="unknown",
+                inferred_type="unknown",
+                semantic_type=sem.get("semantic_type"),
+                confidence=sem.get("confidence"),
+                language=sem.get("language"),
+                pattern=sem.get("pattern"),
+                notes=sem.get("notes"),
+            ))
+
+    total = len(col_infos)
+    covered = sum(1 for c in col_infos if c.semantic_type is not None)
+    semantic_coverage = round(covered / total * 100, 1) if total > 0 else 0.0
+
+    return SchemaResponse(
+        session_id=session_id,
+        dataset_id=context.dataset_id,
+        columns=col_infos,
+        semantic_coverage=semantic_coverage,
     )
 
 

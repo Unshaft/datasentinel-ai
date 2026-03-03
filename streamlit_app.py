@@ -41,8 +41,8 @@ with st.sidebar:
     auth_token = st.text_input("Token Bearer (optionnel)", type="password")
 
     st.divider()
-    st.caption("DataSentinel AI v0.5")
-    st.caption("Pipeline : Profiler → Quality (parallèle) → Score")
+    st.caption("DataSentinel AI v0.8")
+    st.caption("Pipeline : Profiler → Quality (parallèle + LLM) → Score")
 
     if st.button("🩺 Vérifier l'API"):
         try:
@@ -179,8 +179,8 @@ if result.get("needs_human_review"):
 # TABS
 # =========================================================================
 
-tab_issues, tab_scores, tab_corrections, tab_profile, tab_exports, tab_batch, tab_json = st.tabs(
-    ["🐛 Problèmes", "📈 Score / colonne", "🔧 Corrections", "📊 Profil", "📥 Exports", "📦 Batch", "🔩 JSON brut"]
+tab_issues, tab_scores, tab_corrections, tab_profile, tab_exports, tab_batch, tab_comparison, tab_schema, tab_json = st.tabs(
+    ["🐛 Problèmes", "📈 Score / colonne", "🔧 Corrections", "📊 Profil", "📥 Exports", "📦 Batch", "🔄 Comparaison", "🧠 Schéma", "🔩 JSON brut"]
 )
 
 # ---- PROBLÈMES ----
@@ -468,6 +468,395 @@ with tab_batch:
         st.info("Sélectionnez au moins un fichier pour lancer le batch.")
 
 
+# ---- COMPARAISON avant/après ----
+with tab_comparison:
+    st.markdown("### Comparaison avant/après corrections (F19)")
+    st.caption(
+        "Applique les corrections automatiques en mémoire et compare le score de qualité avant et après. "
+        "Aucune persistance : calcul stateless à la demande."
+    )
+    if st.button("🔄 Calculer la comparaison", key="btn_comparison"):
+        with st.spinner("Comparaison en cours…"):
+            try:
+                comp_resp = requests.get(
+                    f"{api_url}/analyze/{session_id}/comparison",
+                    headers=headers,
+                    timeout=60,
+                )
+                if comp_resp.status_code == 200:
+                    cdata = comp_resp.json()
+                    cc1, cc2, cc3 = st.columns(3)
+                    cc1.metric("Score avant", f"{cdata['score_before']:.1f}")
+                    cc2.metric("Score après", f"{cdata['score_after']:.1f}")
+                    delta = cdata["delta"]
+                    cc3.metric("Delta", f"{delta:+.1f}", delta_color="normal")
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        removed = cdata.get("issues_removed", [])
+                        st.subheader(f"✅ Issues supprimées ({len(removed)})")
+                        if removed:
+                            for t in removed:
+                                st.write(f"• {t.replace('_', ' ').title()}")
+                        else:
+                            st.info("Aucune issue supprimée.")
+
+                    with col_b:
+                        remaining = cdata.get("issues_remaining", [])
+                        st.subheader(f"⚠️ Issues restantes ({len(remaining)})")
+                        if remaining:
+                            for t in remaining:
+                                st.write(f"• {t.replace('_', ' ').title()}")
+                        else:
+                            st.success("Toutes les issues ont été corrigées.")
+
+                    improved = cdata.get("columns_improved", [])
+                    if improved:
+                        st.markdown(f"**Colonnes améliorées** : {', '.join(improved)}")
+                elif comp_resp.status_code == 404:
+                    st.warning("Session expirée. Relancez l'analyse.")
+                elif comp_resp.status_code == 422:
+                    st.warning("DataFrame original non disponible — uploadez à nouveau.")
+                else:
+                    st.error(f"Erreur : HTTP {comp_resp.status_code}")
+            except Exception as e:
+                st.error(f"Impossible de calculer la comparaison : {e}")
+
+
+# ---- SCHEMA sémantique (F27/F29 — v0.8) ----
+with tab_schema:
+    st.markdown("### Schéma sémantique des colonnes (v0.8)")
+
+    semantic_types = result.get("semantic_types")
+    session_id_for_schema = st.session_state.get("analysis_session_id")
+
+    if not semantic_types:
+        st.info(
+            "Types sémantiques non disponibles pour cette analyse.\n\n"
+            "**Pour activer la classification LLM des colonnes :**\n"
+            "```\nENABLE_LLM_CHECKS=true\n```\n"
+            "dans votre `.env`, puis redémarrez le serveur et relancez une analyse."
+        )
+    else:
+        # Tableau de synthèse
+        st.caption(f"{len(semantic_types)} colonne(s) classifiée(s) par le LLM")
+        rows = []
+        for col_name, sem_info in semantic_types.items():
+            conf = sem_info.get("confidence", 0.0)
+            badge = "🟢" if conf >= 0.9 else "🟡" if conf >= 0.7 else "🔴"
+            rows.append({
+                "Colonne": col_name,
+                "Type sémantique": sem_info.get("semantic_type", "—"),
+                "Confiance": f"{badge} {conf:.0%}",
+                "Langue": sem_info.get("language") or "—",
+                "Pattern": sem_info.get("pattern") or "—",
+                "Notes": (sem_info.get("notes") or "")[:60],
+            })
+        if rows:
+            import pandas as _pd
+            st.dataframe(_pd.DataFrame(rows), use_container_width=True)
+
+        # Bouton pour récupérer le schéma complet via API
+        if session_id_for_schema:
+            st.divider()
+            if st.button("Charger le schéma complet via /schema"):
+                try:
+                    headers = {}
+                    if auth_token:
+                        headers["Authorization"] = f"Bearer {auth_token}"
+                    schema_resp = requests.get(
+                        f"{api_url}/analyze/{session_id_for_schema}/schema",
+                        headers=headers,
+                    )
+                    if schema_resp.status_code == 200:
+                        schema_data = schema_resp.json()
+                        cov = schema_data.get("semantic_coverage", 0.0)
+                        st.metric("Couverture sémantique", f"{cov:.1f}%")
+                        st.json(schema_data)
+
+                        # Téléchargement JSON
+                        import json as _json
+                        st.download_button(
+                            label="⬇ Télécharger schema.json",
+                            data=_json.dumps(schema_data, indent=2, ensure_ascii=False),
+                            file_name=f"schema_{session_id_for_schema}.json",
+                            mime="application/json",
+                        )
+                    else:
+                        st.error(f"Erreur : HTTP {schema_resp.status_code}")
+                except Exception as e:
+                    st.error(f"Impossible de récupérer le schéma : {e}")
+
+
 # ---- JSON brut ----
 with tab_json:
     st.json(result)
+
+
+# =============================================================================
+# SECTIONS GLOBALES (indépendantes d'une session)
+# =============================================================================
+
+st.divider()
+st.markdown("## Outils globaux")
+
+global_tab_stats, global_tab_jobs, global_tab_rules = st.tabs(
+    ["📊 Stats système", "⏳ Jobs asynchrones", "📋 Règles métier"]
+)
+
+
+# ---- STATS (F22) ----
+with global_tab_stats:
+    st.markdown("### Tableau de bord analytique")
+    st.caption("Agrégats de toutes les analyses effectuées depuis le démarrage du serveur.")
+
+    if st.button("🔄 Rafraîchir les stats", key="btn_refresh_stats"):
+        st.session_state.pop("stats_data", None)
+
+    if "stats_data" not in st.session_state:
+        try:
+            stats_resp = requests.get(f"{api_url}/stats", headers=headers, timeout=10)
+            if stats_resp.status_code == 200:
+                st.session_state["stats_data"] = stats_resp.json()
+            else:
+                st.error(f"Erreur stats : HTTP {stats_resp.status_code}")
+        except Exception as e:
+            st.error(f"Impossible de récupérer les stats : {e}")
+
+    stats_data = st.session_state.get("stats_data")
+    if stats_data:
+        s1, s2 = st.columns(2)
+        s1.metric("Total sessions analysées", stats_data["total_sessions"])
+        s2.metric("Score moyen", f"{stats_data['avg_quality_score']:.1f}")
+
+        top_issues = stats_data.get("top_issue_types", {})
+        if top_issues:
+            st.subheader("Top types d'issues")
+            st.bar_chart(top_issues)
+
+        sessions_by_day = stats_data.get("sessions_by_day", {})
+        if sessions_by_day:
+            st.subheader("Sessions par jour (7 derniers jours)")
+            st.bar_chart(sessions_by_day)
+
+        score_dist = stats_data.get("score_distribution", {})
+        if score_dist:
+            st.subheader("Distribution des scores")
+            st.bar_chart(score_dist)
+
+        st.caption(f"Mis à jour : {stats_data.get('updated_at', '—')}")
+
+        if st.button("🗑️ Réinitialiser les stats", key="btn_reset_stats"):
+            try:
+                r = requests.delete(f"{api_url}/stats", headers=headers, timeout=10)
+                if r.status_code == 200:
+                    st.session_state.pop("stats_data", None)
+                    st.success("Stats remises à zéro.")
+                    st.rerun()
+                else:
+                    st.error(f"Erreur reset : HTTP {r.status_code}")
+            except Exception as e:
+                st.error(f"Erreur : {e}")
+    else:
+        try:
+            stats_resp = requests.get(f"{api_url}/stats", headers=headers, timeout=10)
+            if stats_resp.status_code == 200:
+                st.session_state["stats_data"] = stats_resp.json()
+                st.rerun()
+        except Exception:
+            st.info("Cliquez sur 'Rafraîchir les stats' pour charger les données.")
+
+
+# ---- JOBS (F21) ----
+with global_tab_jobs:
+    st.markdown("### Analyse asynchrone par job")
+    st.caption(
+        "Pour les gros fichiers, soumettez un job et revenez vérifier son statut "
+        "sans attendre la fin de l'analyse."
+    )
+
+    job_file = st.file_uploader(
+        "Fichier à analyser en tâche de fond",
+        type=["csv", "parquet"],
+        key="job_uploader",
+    )
+
+    if job_file and st.button("🚀 Soumettre le job", key="btn_submit_job", type="primary"):
+        try:
+            job_resp = requests.post(
+                f"{api_url}/jobs/analyze",
+                files={"file": (job_file.name, job_file.getvalue(), job_file.type)},
+                headers=headers,
+                timeout=15,
+            )
+            if job_resp.status_code == 202:
+                jdata = job_resp.json()
+                st.session_state["current_job_id"] = jdata["job_id"]
+                st.success(f"Job soumis ! ID : `{jdata['job_id']}`")
+            else:
+                try:
+                    detail = job_resp.json().get("detail", job_resp.text)
+                except Exception:
+                    detail = job_resp.text
+                st.error(f"Erreur soumission (HTTP {job_resp.status_code}) : {detail}")
+        except Exception as e:
+            st.error(f"Impossible de soumettre le job : {e}")
+
+    st.divider()
+    job_id_input = st.text_input(
+        "ID du job à vérifier",
+        value=st.session_state.get("current_job_id", ""),
+        placeholder="job_xxxxxxxxxxxxxxxx",
+        key="job_id_input",
+    )
+
+    if job_id_input and st.button("🔍 Vérifier le statut", key="btn_check_job"):
+        try:
+            status_resp = requests.get(
+                f"{api_url}/jobs/{job_id_input}",
+                headers=headers,
+                timeout=10,
+            )
+            if status_resp.status_code == 200:
+                jstatus = status_resp.json()
+                status = jstatus["status"]
+                progress = jstatus.get("progress", 0)
+
+                status_badge = {
+                    "pending": "⏳ En attente",
+                    "running": "🔄 En cours",
+                    "completed": "✅ Terminé",
+                    "failed": "❌ Échoué",
+                }.get(status, status)
+
+                st.metric("Statut", status_badge)
+                st.progress(int(progress))
+
+                if status == "completed" and jstatus.get("result"):
+                    res = jstatus["result"]
+                    st.success(f"Score : {res.get('quality_score', '?'):.1f} — {len(res.get('issues', []))} issues")
+                    with st.expander("Voir les résultats complets"):
+                        st.json(res)
+                elif status == "failed" and jstatus.get("error"):
+                    st.error(f"Erreur : {jstatus['error']}")
+            elif status_resp.status_code == 404:
+                st.warning(f"Job `{job_id_input}` introuvable ou expiré (TTL 2h).")
+            else:
+                st.error(f"Erreur : HTTP {status_resp.status_code}")
+        except Exception as e:
+            st.error(f"Impossible de vérifier le job : {e}")
+
+
+# ---- RÈGLES MÉTIER (F20) ----
+with global_tab_rules:
+    st.markdown("### Gestion des règles métier (CRUD)")
+    st.caption(
+        "Les règles métier sont utilisées par le QualityAgent (Active RAG) pour "
+        "ajuster les seuils de détection. Exemples : 'email est obligatoire', "
+        "'identifiant unique', 'format strict'."
+    )
+
+    rule_col1, rule_col2 = st.columns([2, 1])
+
+    with rule_col1:
+        st.subheader("Ajouter une règle")
+        new_rule_text = st.text_area(
+            "Texte de la règle",
+            placeholder="Ex : La colonne 'email' est obligatoire et doit être unique",
+            key="new_rule_text",
+        )
+        r1, r2, r3 = st.columns(3)
+        rule_type = r1.selectbox("Type", ["constraint", "validation", "format", "consistency"], key="rule_type")
+        rule_severity = r2.selectbox("Sévérité", ["low", "medium", "high", "critical"], index=1, key="rule_severity")
+        rule_category = r3.text_input("Catégorie", value="general", key="rule_category")
+
+        if st.button("➕ Ajouter la règle", key="btn_add_rule", type="primary", disabled=not new_rule_text.strip()):
+            try:
+                add_resp = requests.post(
+                    f"{api_url}/rules",
+                    json={
+                        "rule_text": new_rule_text.strip(),
+                        "rule_type": rule_type,
+                        "severity": rule_severity,
+                        "category": rule_category,
+                    },
+                    headers=headers,
+                    timeout=10,
+                )
+                if add_resp.status_code == 201:
+                    st.success(f"Règle ajoutée : `{add_resp.json()['rule']['rule_id']}`")
+                    st.session_state.pop("rules_data", None)
+                    st.rerun()
+                else:
+                    try:
+                        detail = add_resp.json().get("detail", add_resp.text)
+                    except Exception:
+                        detail = add_resp.text
+                    st.error(f"Erreur (HTTP {add_resp.status_code}) : {detail}")
+            except Exception as e:
+                st.error(f"Impossible d'ajouter la règle : {e}")
+
+    with rule_col2:
+        st.subheader("Filtres")
+        filter_type = st.selectbox(
+            "Type de règle",
+            ["Tous", "constraint", "validation", "format", "consistency", "exception", "example"],
+            key="filter_rule_type",
+        )
+        if st.button("🔄 Recharger", key="btn_reload_rules"):
+            st.session_state.pop("rules_data", None)
+
+    st.divider()
+    st.subheader("Règles actives")
+
+    # Charger les règles
+    if "rules_data" not in st.session_state:
+        try:
+            params = {}
+            if filter_type != "Tous":
+                params["rule_type"] = filter_type
+            rules_resp = requests.get(
+                f"{api_url}/rules",
+                headers=headers,
+                params=params,
+                timeout=10,
+            )
+            if rules_resp.status_code == 200:
+                st.session_state["rules_data"] = rules_resp.json()
+        except Exception as e:
+            st.error(f"Impossible de charger les règles : {e}")
+
+    rules_data = st.session_state.get("rules_data")
+    if rules_data:
+        count = rules_data.get("count", 0)
+        st.caption(f"{count} règle(s) active(s)")
+
+        if count == 0:
+            st.info("Aucune règle active. Ajoutez-en une ci-dessus.")
+        else:
+            for rule in rules_data.get("rules", []):
+                with st.expander(f"[{rule.get('rule_type', '?').upper()}] {rule.get('text', '')[:80]}…"):
+                    rc1, rc2 = st.columns([3, 1])
+                    rc1.markdown(f"**ID** : `{rule['rule_id']}`  \n**Texte** : {rule['text']}")
+                    rc1.markdown(
+                        f"**Type** : {rule.get('rule_type')}  |  "
+                        f"**Sévérité** : {rule.get('severity')}  |  "
+                        f"**Catégorie** : {rule.get('category')}"
+                    )
+                    if rc2.button("🗑️ Désactiver", key=f"del_rule_{rule['rule_id']}"):
+                        try:
+                            del_resp = requests.delete(
+                                f"{api_url}/rules/{rule['rule_id']}",
+                                headers=headers,
+                                timeout=10,
+                            )
+                            if del_resp.status_code == 200:
+                                st.success(f"Règle `{rule['rule_id']}` désactivée.")
+                                st.session_state.pop("rules_data", None)
+                                st.rerun()
+                            else:
+                                st.error(f"Erreur : HTTP {del_resp.status_code}")
+                        except Exception as e:
+                            st.error(f"Erreur : {e}")
+    else:
+        st.info("Cliquez sur '🔄 Recharger' pour charger les règles.")

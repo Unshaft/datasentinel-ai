@@ -10,14 +10,18 @@ Cet agent est responsable de l'identification des problèmes:
 """
 
 import json
+import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
 
 from src.agents.base import AgentResult, BaseAgent
+
+logger = logging.getLogger(__name__)
 from src.core.models import (
     AgentContext,
     AgentType,
@@ -30,6 +34,15 @@ from src.ml.anomaly_detector import AnomalyDetector
 from src.ml.drift_detector import DriftDetector, DriftSeverity
 from src.tools.anomaly import create_anomaly_tools
 from src.tools.rules import create_rules_tools
+
+
+@dataclass
+class RuleContext:
+    """Contexte de règles pour une colonne (Active RAG — F25)."""
+    rules: list[str] = field(default_factory=list)
+    null_threshold_override: float | None = None
+    severity_override: "Severity | None" = None
+    format_tolerance_override: float | None = None
 
 
 class QualityAgent(BaseAgent):
@@ -98,6 +111,10 @@ class QualityAgent(BaseAgent):
         # Accès direct au store pour la validation de règles métier dans
         # _validate_against_rules (sans passer par le LLM).
         self.store = get_chroma_store()
+        # Cache RuleContext par (col_name, col_type) pour la session courante (F25)
+        self._rule_context_cache: dict[str, RuleContext] = {}
+        # Ajustements de confiance issus du FeedbackProcessor (F26)
+        self._confidence_adjustments: dict[str, float] = self._load_confidence_adjustments()
 
     @property
     def system_prompt(self) -> str:
@@ -129,6 +146,59 @@ Tu ne dois PAS:
 - Ignorer les problèmes mineurs (les signaler avec LOW severity)
 """
 
+    @staticmethod
+    def _load_confidence_adjustments() -> dict[str, float]:
+        """Charge les ajustements de confiance issus du feedback (F26, best-effort)."""
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            fp = _Path("./data/feedback_stats.json")
+            if fp.exists():
+                data = _json.loads(fp.read_text(encoding="utf-8"))
+                return data.get("confidence_adjustments", {})
+        except Exception:
+            pass
+        return {}
+
+    def _get_rule_context(self, col_name: str, col_type: str) -> RuleContext:
+        """
+        Requête Active RAG : récupère les règles pertinentes pour une colonne.
+        Résultats mis en cache par (col_name, col_type) pendant la session (F25).
+        """
+        cache_key = f"{col_name}:{col_type}"
+        if cache_key in self._rule_context_cache:
+            return self._rule_context_cache[cache_key]
+
+        ctx = RuleContext()
+        try:
+            rules = self.store.get_relevant_rules(col_name, col_type, top_k=3)
+            # Seuil minimal de pertinence (même que _validate_against_rules)
+            relevant = [r for r in rules if r.get("similarity", 0) >= 0.55]
+            if not relevant:
+                self._rule_context_cache[cache_key] = ctx
+                return ctx
+
+            ctx.rules = [r["text"] for r in relevant]
+            combined = " ".join(ctx.rules).lower()
+
+            # Parsing des overrides
+            if any(kw in combined for kw in ("obligatoire", "required", "non null", "not null")):
+                ctx.null_threshold_override = 0.01
+            elif any(kw in combined for kw in ("optionnel", "nullable", "peut être null")):
+                ctx.null_threshold_override = 0.8
+
+            if any(kw in combined for kw in ("identifiant unique", "clé primaire", "primary key", "unique key")):
+                ctx.severity_override = Severity.CRITICAL
+
+            if any(kw in combined for kw in ("format strict", "strict format")):
+                ctx.format_tolerance_override = 0.0
+
+        except Exception:
+            pass  # Best-effort — ne jamais bloquer l'analyse
+
+        self._rule_context_cache[cache_key] = ctx
+        return ctx
+
     def execute(
         self,
         context: AgentContext,
@@ -146,6 +216,8 @@ Tu ne dois PAS:
         Returns:
             Contexte mis à jour avec les issues
         """
+        # Réinitialise le cache de règles par session (F25)
+        self._rule_context_cache = {}
         start_time = time.time()
 
         issues = []
@@ -182,6 +254,16 @@ Tu ne dois PAS:
         # 8. Validation contre les règles métier
         rule_issues = self._validate_against_rules(df, context)
         issues.extend(rule_issues)
+
+        _tmap: dict[str, int] = {}
+        for _iss in issues:
+            _tmap[_iss.issue_type.value] = _tmap.get(_iss.issue_type.value, 0) + 1
+        logger.info(
+            "%d issues — %s (%dms)",
+            len(issues),
+            " ".join(f"{k}={v}" for k, v in sorted(_tmap.items())) or "none",
+            int((time.time() - start_time) * 1000),
+        )
 
         # Mettre à jour le contexte
         context.issues = issues
@@ -220,18 +302,35 @@ Tu ne dois PAS:
             null_pct = null_count / len(df) if len(df) > 0 else 0
 
             if null_pct > 0:
-                # Déterminer la sévérité
-                if null_pct >= self.NULL_THRESHOLD_HIGH:
+                # Active RAG : récupère les overrides de règles (F25)
+                col_type = str(df[col].dtype)
+                rule_ctx = self._get_rule_context(col, col_type)
+                null_high = rule_ctx.null_threshold_override or self.NULL_THRESHOLD_HIGH
+                null_med = rule_ctx.null_threshold_override or self.NULL_THRESHOLD_MEDIUM
+                null_low = rule_ctx.null_threshold_override or self.NULL_THRESHOLD_LOW
+
+                # Déterminer la sévérité (override possible via règle)
+                if rule_ctx.severity_override:
+                    severity = rule_ctx.severity_override
+                elif null_pct >= null_high:
                     severity = Severity.HIGH
-                elif null_pct >= self.NULL_THRESHOLD_MEDIUM:
+                elif null_pct >= null_med:
                     severity = Severity.MEDIUM
-                elif null_pct >= self.NULL_THRESHOLD_LOW:
+                elif null_pct >= null_low:
                     severity = Severity.LOW
                 else:
                     continue  # Trop peu de nulls pour signaler
 
                 # Identifier les indices des lignes avec nulls
                 null_indices = df[df[col].isna()].index.tolist()
+
+                details: dict[str, Any] = {
+                    "null_count": int(null_count),
+                    "null_percentage": round(null_pct * 100, 2),
+                    "total_rows": len(df)
+                }
+                if rule_ctx.rules:
+                    details["applied_rules"] = rule_ctx.rules
 
                 issue = QualityIssue(
                     issue_id=f"issue_{uuid.uuid4().hex[:8]}",
@@ -240,11 +339,7 @@ Tu ne dois PAS:
                     column=col,
                     row_indices=null_indices[:100],  # Limiter pour performance
                     description=f"Colonne '{col}' contient {null_count} valeurs manquantes ({null_pct:.1%})",
-                    details={
-                        "null_count": int(null_count),
-                        "null_percentage": round(null_pct * 100, 2),
-                        "total_rows": len(df)
-                    },
+                    details=details,
                     affected_count=int(null_count),
                     affected_percentage=round(null_pct * 100, 2),
                     confidence=0.95,  # Détection certaine
@@ -791,6 +886,32 @@ Tu ne dois PAS:
         for result_list in results:
             issues.extend(result_list)
 
+        _tmap: dict[str, int] = {}
+        for _iss in issues:
+            _tmap[_iss.issue_type.value] = _tmap.get(_iss.issue_type.value, 0) + 1
+        logger.info(
+            "%d issues — %s (%dms)",
+            len(issues),
+            " ".join(f"{k}={v}" for k, v in sorted(_tmap.items())) or "none",
+            int((time.time() - start_time) * 1000),
+        )
+
+        # 9. LLM semantic check (opt-in F23 — skippé si F27 a déjà tourné)
+        from src.core.config import settings as _settings
+        if _settings.enable_llm_checks and "semantic_types" not in context.metadata:
+            try:
+                llm_issues = await self._detect_semantic_anomalies_llm(df, context)
+                issues.extend(llm_issues)
+            except Exception:
+                pass
+
+        # 10. Semantic-type validators (F28 — lit context.metadata["semantic_types"])
+        try:
+            semantic_issues = self._validate_semantic_types(df, context)
+            issues.extend(semantic_issues)
+        except Exception:  # noqa: BLE001
+            pass
+
         context.issues = issues
         # Score par colonne (v0.4)
         context.metadata["column_scores"] = self._compute_column_scores(df, issues)
@@ -862,3 +983,275 @@ Sois concis et actionnable."""
         context.metadata["quality_llm_analysis"] = llm_analysis
 
         return context, llm_analysis
+
+    def _validate_semantic_types(
+        self,
+        df: pd.DataFrame,
+        context: AgentContext,
+    ) -> list[QualityIssue]:
+        """
+        Applique des règles métier basées sur les types sémantiques LLM (F28 — v0.8).
+
+        Lit context.metadata["semantic_types"] (populé par SemanticProfilerAgent).
+        Applique des validateurs ciblés selon le semantic_type de chaque colonne.
+        Skip silencieusement si semantic_types est absent ou vide.
+
+        Règles appliquées :
+        - monetary_amount : valeurs négatives → ANOMALY MEDIUM
+        - percentage       : hors [0, 100] → ANOMALY MEDIUM
+        - age              : hors [0, 150] → ANOMALY MEDIUM
+        - email/phone/url/postal_code : format check via regex existant si nom de col ne matche pas
+        """
+        semantic_types: dict = context.metadata.get("semantic_types", {})
+        if not semantic_types:
+            return []
+
+        issues: list[QualityIssue] = []
+
+        # Regexes réutilisées depuis _FORMAT_PATTERNS
+        format_re = {k: v[0] for k, v in self._FORMAT_PATTERNS.items()}
+
+        for col, sem_info in semantic_types.items():
+            if col not in df.columns:
+                continue
+            sem_type = sem_info.get("semantic_type", "")
+            confidence = float(sem_info.get("confidence", 0.0))
+            if confidence < 0.7:
+                continue
+
+            base_details = {
+                "semantic_type": sem_type,
+                "detection_method": "semantic",
+                "confidence": confidence,
+            }
+            col_series = df[col].dropna()
+            total = len(df)
+            if total == 0:
+                continue
+
+            # ── Règle : monetary_amount → pas de valeurs négatives ────────────
+            if sem_type == "monetary_amount":
+                try:
+                    numeric = pd.to_numeric(col_series, errors="coerce").dropna()
+                    neg_mask = numeric < 0
+                    if neg_mask.any():
+                        neg_count = int(neg_mask.sum())
+                        issues.append(QualityIssue(
+                            issue_id=f"sem_neg_{col}_{uuid.uuid4().hex[:8]}",
+                            issue_type=IssueType.ANOMALY,
+                            severity=Severity.MEDIUM,
+                            column=col,
+                            description=(
+                                f"Colonne '{col}' (monetary_amount) contient "
+                                f"{neg_count} valeur(s) négative(s)."
+                            ),
+                            details={**base_details, "negative_count": neg_count},
+                            affected_count=neg_count,
+                            affected_percentage=round(neg_count / total * 100, 2),
+                            confidence=confidence,
+                            detected_by=AgentType.QUALITY,
+                        ))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # ── Règle : percentage → [0, 100] ─────────────────────────────────
+            elif sem_type == "percentage":
+                try:
+                    numeric = pd.to_numeric(col_series, errors="coerce").dropna()
+                    out_mask = (numeric < 0) | (numeric > 100)
+                    if out_mask.any():
+                        out_count = int(out_mask.sum())
+                        issues.append(QualityIssue(
+                            issue_id=f"sem_pct_{col}_{uuid.uuid4().hex[:8]}",
+                            issue_type=IssueType.ANOMALY,
+                            severity=Severity.MEDIUM,
+                            column=col,
+                            description=(
+                                f"Colonne '{col}' (percentage) contient "
+                                f"{out_count} valeur(s) hors plage [0, 100]."
+                            ),
+                            details={**base_details, "out_of_range_count": out_count},
+                            affected_count=out_count,
+                            affected_percentage=round(out_count / total * 100, 2),
+                            confidence=confidence,
+                            detected_by=AgentType.QUALITY,
+                        ))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # ── Règle : age → [0, 150] ────────────────────────────────────────
+            elif sem_type == "age":
+                try:
+                    numeric = pd.to_numeric(col_series, errors="coerce").dropna()
+                    out_mask = (numeric < 0) | (numeric > 150)
+                    if out_mask.any():
+                        out_count = int(out_mask.sum())
+                        issues.append(QualityIssue(
+                            issue_id=f"sem_age_{col}_{uuid.uuid4().hex[:8]}",
+                            issue_type=IssueType.ANOMALY,
+                            severity=Severity.MEDIUM,
+                            column=col,
+                            description=(
+                                f"Colonne '{col}' (age) contient "
+                                f"{out_count} valeur(s) hors plage [0, 150]."
+                            ),
+                            details={**base_details, "out_of_range_count": out_count},
+                            affected_count=out_count,
+                            affected_percentage=round(out_count / total * 100, 2),
+                            confidence=confidence,
+                            detected_by=AgentType.QUALITY,
+                        ))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # ── Règle : email/phone/url/postal_code → format via regex ────────
+            elif sem_type in ("email", "phone", "url", "postal_code"):
+                regex_key = "postal_fr" if sem_type == "postal_code" else sem_type
+                pattern = format_re.get(regex_key)
+                if pattern is None:
+                    continue
+                str_series = col_series.astype(str)
+                invalid_mask = ~str_series.str.match(pattern, na=False)
+                invalid_count = int(invalid_mask.sum())
+                if invalid_count == 0:
+                    continue
+                invalid_pct = invalid_count / total * 100
+                # Seuil 5% pour éviter trop de bruit (cohérent avec _detect_format_issues)
+                if invalid_pct < 5.0:
+                    continue
+                issues.append(QualityIssue(
+                    issue_id=f"sem_fmt_{col}_{uuid.uuid4().hex[:8]}",
+                    issue_type=IssueType.FORMAT_ERROR,
+                    severity=Severity.MEDIUM,
+                    column=col,
+                    description=(
+                        f"Colonne '{col}' (type sémantique: {sem_type}) : "
+                        f"{invalid_count} valeur(s) au format invalide ({invalid_pct:.1f}%)."
+                    ),
+                    details={**base_details, "invalid_count": invalid_count},
+                    affected_count=invalid_count,
+                    affected_percentage=round(invalid_pct, 2),
+                    confidence=round(confidence * 0.9, 3),
+                    detected_by=AgentType.QUALITY,
+                ))
+
+        return issues
+
+    async def _detect_semantic_anomalies_llm(
+        self,
+        df: pd.DataFrame,
+        context: AgentContext,
+    ) -> list[QualityIssue]:
+        """
+        Détection sémantique via Claude (F23 — opt-in ENABLE_LLM_CHECKS=True).
+
+        Boucle sur les colonnes `object`, échantillonne 20 valeurs,
+        appelle Claude avec le tool `flag_anomaly`. Max 5 colonnes, timeout 10s,
+        fallback silencieux si l'API échoue.
+        """
+        import asyncio as _asyncio
+
+        from src.core.config import settings
+
+        if not settings.enable_llm_checks:
+            return []
+
+        try:
+            import anthropic
+        except ImportError:
+            return []
+
+        object_cols = list(df.select_dtypes(include="object").columns)[:5]
+        if not object_cols:
+            return []
+
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+        tools: list[dict] = [
+            {
+                "name": "flag_anomaly",
+                "description": (
+                    "Signale une anomalie sémantique détectée dans un échantillon de valeurs "
+                    "(format incohérent, valeur impossible, pattern suspect, etc.)."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "column": {"type": "string", "description": "Nom de la colonne"},
+                        "value": {"type": "string", "description": "Valeur anormale"},
+                        "reason": {"type": "string", "description": "Raison de l'anomalie"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "critical"],
+                        },
+                    },
+                    "required": ["column", "value", "reason", "severity"],
+                },
+            }
+        ]
+
+        severity_map = {
+            "low": Severity.LOW,
+            "medium": Severity.MEDIUM,
+            "high": Severity.HIGH,
+            "critical": Severity.CRITICAL,
+        }
+
+        issues: list[QualityIssue] = []
+
+        for col in object_cols:
+            non_null = df[col].dropna()
+            if non_null.empty:
+                continue
+
+            sample_size = min(20, len(non_null))
+            sample = non_null.sample(sample_size, random_state=42).astype(str).tolist()
+
+            prompt = (
+                f"Analyze these sample values from column '{col}' and identify semantic anomalies "
+                f"(inconsistent formats, impossible values, suspicious patterns).\n"
+                f"Values: {sample}\n"
+                f"Call flag_anomaly for each anomaly you find. "
+                f"If values look normal, do not call the tool."
+            )
+
+            try:
+                response = await _asyncio.wait_for(
+                    client.messages.create(
+                        model=settings.llm_check_model,
+                        max_tokens=512,
+                        tools=tools,  # type: ignore[arg-type]
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=10.0,
+                )
+
+                for block in response.content:
+                    if block.type == "tool_use" and block.name == "flag_anomaly":
+                        inp = block.input
+                        issues.append(QualityIssue(
+                            issue_id=f"issue_{uuid.uuid4().hex[:8]}",
+                            issue_type=IssueType.ANOMALY,
+                            severity=severity_map.get(inp.get("severity", "medium"), Severity.MEDIUM),
+                            column=col,
+                            row_indices=[],
+                            description=(
+                                f"[LLM] {inp.get('reason', 'Anomalie sémantique')} "
+                                f"(valeur: {inp.get('value')})"
+                            ),
+                            details={
+                                "detection_method": "llm",
+                                "model": settings.llm_check_model,
+                                "flagged_value": inp.get("value"),
+                            },
+                            affected_count=1,
+                            affected_percentage=round(100.0 / max(len(df), 1), 4),
+                            confidence=0.7,
+                            detected_by=AgentType.QUALITY,
+                        ))
+
+            except Exception:
+                # Fallback silencieux — LLM check best-effort
+                pass
+
+        return issues

@@ -13,7 +13,7 @@ Design Principles:
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -80,6 +80,45 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     ESCALATED = "escalated"  # Remonté pour intervention humaine
+
+
+class SemanticType(str, Enum):
+    """Type sémantique / métier d'une colonne (F27 — v0.8)."""
+
+    EMAIL = "email"
+    PHONE = "phone"
+    FIRST_NAME = "first_name"
+    LAST_NAME = "last_name"
+    FULL_NAME = "full_name"
+    POSTAL_CODE = "postal_code"
+    ADDRESS = "address"
+    CITY = "city"
+    COUNTRY = "country"
+    IDENTIFIER = "identifier"
+    MONETARY_AMOUNT = "monetary_amount"
+    PERCENTAGE = "percentage"
+    AGE = "age"
+    DATE_STRING = "date_string"
+    URL = "url"
+    IP_ADDRESS = "ip_address"
+    BOOLEAN_TEXT = "boolean_text"
+    CATEGORY = "category"
+    PRODUCT_CODE = "product_code"
+    EMPLOYEE_ID = "employee_id"
+    DESCRIPTION = "description"
+    FREE_TEXT = "free_text"
+    QUANTITY = "quantity"
+    RATING = "rating"
+
+
+class SemanticColumnType(TypedDict, total=False):
+    """Résultat de classification sémantique d'une colonne (F27 — v0.8)."""
+
+    semantic_type: str          # Valeur de SemanticType enum
+    confidence: float           # 0.0 – 1.0
+    language: str | None        # "fr", "en", etc.
+    pattern: str | None         # Regex détectée si applicable
+    notes: str | None           # Observations additionnelles
 
 
 # =============================================================================

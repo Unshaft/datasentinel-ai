@@ -19,6 +19,7 @@ from src.api.limiter import limiter
 from src.api.schemas.responses import BatchAnalyzeResponse, BatchResultItem, ErrorResponse
 from src.core.config import settings
 from src.core.models import AgentContext
+from src.core.stats_manager import get_stats_manager
 from src.memory.session_store import get_session_store
 
 router = APIRouter(prefix="/batch", tags=["Batch"])
@@ -90,6 +91,16 @@ async def _analyze_one(filename: str, content: bytes) -> BatchResultItem:
         store = get_session_store()
         store.save(context.session_id, context)
         store.save_dataframe(context.session_id, df)
+    except Exception:
+        pass
+
+    # Stats (best-effort)
+    try:
+        issue_types = [iss.issue_type.value for iss in context.issues]
+        get_stats_manager().record_session(
+            context.metadata.get("quality_score", 100),
+            issue_types,
+        )
     except Exception:
         pass
 

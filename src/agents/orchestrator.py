@@ -11,6 +11,7 @@ Il coordonne les agents spécialisés selon la tâche demandée:
 C'est ici que se manifeste la logique "agentique" du système.
 """
 
+import logging
 import time
 import uuid
 from enum import Enum
@@ -22,10 +23,13 @@ from src.agents.base import AgentResult, BaseAgent
 from src.agents.corrector import CorrectorAgent
 from src.agents.profiler import ProfilerAgent
 from src.agents.quality import QualityAgent
+from src.agents.semantic_profiler import SemanticProfilerAgent
 from src.agents.validator import ValidatorAgent
 from src.core.config import settings
 from src.core.models import AgentContext, AgentType, Severity, TaskStatus
 from src.ml.confidence_scorer import ConfidenceScorer
+
+logger = logging.getLogger(__name__)
 
 
 class TaskType(str, Enum):
@@ -64,6 +68,7 @@ class OrchestratorAgent(BaseAgent):
 
         # Initialiser les agents spécialisés
         self.profiler = ProfilerAgent()
+        self.semantic_profiler = SemanticProfilerAgent()
         self.quality_agent = QualityAgent()
         self.corrector = CorrectorAgent()
         self.validator = ValidatorAgent()
@@ -142,6 +147,7 @@ Tu dois être:
             Contexte mis à jour
         """
         start_time = time.time()
+        logger.info("Pipeline START — %s %d×%d", task_type.value, len(df), len(df.columns))
 
         # Sélectionner et exécuter les agents
         if task_type == TaskType.PROFILE_ONLY:
@@ -171,7 +177,12 @@ Tu dois être:
 
         # Finaliser
         context = self._finalize(context, df, start_time)
-
+        logger.info(
+            "Pipeline END — score=%.1f | %d issues | %dms",
+            context.metadata.get("quality_score", 0),
+            len(context.issues),
+            context.metadata.get("processing_time_ms", 0),
+        )
         return context
 
     async def run_pipeline_async(
@@ -200,6 +211,7 @@ Tu dois être:
         import asyncio
 
         start_time = time.time()
+        logger.info("Pipeline START — %s %d×%d", task_type.value, len(df), len(df.columns))
 
         if task_type == TaskType.PROFILE_ONLY:
             context = await asyncio.to_thread(self._run_profiling, context, df)
@@ -210,16 +222,19 @@ Tu dois être:
 
         elif task_type == TaskType.ANALYZE:
             context = await asyncio.to_thread(self._run_profiling, context, df)
+            context = await self.semantic_profiler.enrich_async(context, df)
             context = await self._run_quality_check_async(context, df, **options)
 
         elif task_type == TaskType.RECOMMEND:
             context = await asyncio.to_thread(self._run_profiling, context, df)
+            context = await self.semantic_profiler.enrich_async(context, df)
             context = await self._run_quality_check_async(context, df, **options)
             if context.issues:
                 context = await asyncio.to_thread(self._run_correction, context, df)
 
         elif task_type == TaskType.FULL_PIPELINE:
             context = await asyncio.to_thread(self._run_profiling, context, df)
+            context = await self.semantic_profiler.enrich_async(context, df)
             context = await self._run_quality_check_async(context, df, **options)
             if context.issues:
                 context = await asyncio.to_thread(self._run_correction, context, df)
@@ -227,7 +242,154 @@ Tu dois être:
                     context = await asyncio.to_thread(self._run_validation, context, df)
 
         context = await asyncio.to_thread(self._finalize, context, df, start_time)
+        logger.info(
+            "Pipeline END — score=%.1f | %d issues | %dms",
+            context.metadata.get("quality_score", 0),
+            len(context.issues),
+            context.metadata.get("processing_time_ms", 0),
+        )
         return context
+
+    async def run_pipeline_adaptive(
+        self,
+        context: AgentContext,
+        df: pd.DataFrame,
+        task_type: TaskType = TaskType.ANALYZE,
+        **options: Any,
+    ) -> AgentContext:
+        """
+        Pipeline adaptatif ReAct (F24 — v0.7).
+
+        Phases :
+        1. Observe  — Profiler exécuté en premier
+        2. Reason   — _build_execution_plan() décide les checks à lancer
+        3. Act      — Quality checks sélectifs
+        4. Observe  — Si CRITICAL → re-planification
+
+        Le raisonnement est tracé dans context.metadata["reasoning_steps"].
+        L'API expose ces étapes si include_reasoning=True dans la requête.
+        """
+        import asyncio
+
+        start_time = time.time()
+        logger.info("Pipeline START — %s(adaptive) %d×%d", task_type.value, len(df), len(df.columns))
+        reasoning_steps: list[dict] = []
+
+        # ── Phase 1 : Observe (Profiler + Semantic enrichment) ───────────────
+        context = await asyncio.to_thread(self._run_profiling, context, df)
+        context = await self.semantic_profiler.enrich_async(context, df)
+        sem_count = len(context.metadata.get("semantic_types", {}))
+        reasoning_steps.append({
+            "step": 1,
+            "phase": "observe",
+            "thought": "Profil du dataset disponible.",
+            "action": "profiler.execute() + semantic_profiler.enrich_async()",
+            "observation": (
+                f"rows={context.profile.row_count if context.profile else '?'}, "
+                f"cols={context.profile.column_count if context.profile else '?'}, "
+                f"semantic_types={sem_count}"
+            ),
+        })
+
+        # ── Phase 2 : Reason (plan adaptatif) ────────────────────────────────
+        plan = self._build_execution_plan(context, df, **options)
+        logger.info("[ReAct] Plan: %s", " + ".join(plan))
+        reasoning_steps.append({
+            "step": 2,
+            "phase": "reason",
+            "thought": "Construction du plan d'exécution basé sur le profil.",
+            "action": "_build_execution_plan()",
+            "observation": f"checks retenus: {plan}",
+        })
+
+        # ── Phase 3 : Act (Quality adaptatif) ────────────────────────────────
+        quality_options = {
+            "detect_anomalies": "detect_anomalies" in plan,
+            "detect_drift": options.get("detect_drift", False) and "drift" in plan,
+            "reference_df": options.get("reference_df"),
+            "_skip_checks": [c for c in ["missing_values", "format", "anomaly"] if c not in plan],
+        }
+        context = await self._run_quality_check_async(context, df, **quality_options)
+        reasoning_steps.append({
+            "step": 3,
+            "phase": "act",
+            "thought": "Exécution des checks de qualité sélectifs.",
+            "action": "quality_agent.execute_async()",
+            "observation": f"{len(context.issues)} problèmes détectés.",
+        })
+
+        # ── Phase 4 : Observe (re-plan si critique) ──────────────────────────
+        critical = [i for i in context.issues if i.severity.value == "critical"]
+        if critical and task_type in (TaskType.RECOMMEND, TaskType.FULL_PIPELINE):
+            reasoning_steps.append({
+                "step": 4,
+                "phase": "observe",
+                "thought": f"{len(critical)} problème(s) critique(s) → activation Corrector.",
+                "action": "corrector.execute()",
+                "observation": "Corrections proposées pour les problèmes critiques.",
+            })
+            context = await asyncio.to_thread(self._run_correction, context, df)
+
+        context.metadata["reasoning_steps"] = reasoning_steps
+        context = await asyncio.to_thread(self._finalize, context, df, start_time)
+        logger.info(
+            "Pipeline END — score=%.1f | %d issues | %dms",
+            context.metadata.get("quality_score", 0),
+            len(context.issues),
+            context.metadata.get("processing_time_ms", 0),
+        )
+        return context
+
+    def _build_execution_plan(
+        self,
+        context: AgentContext,
+        df: pd.DataFrame,
+        **options: Any,
+    ) -> list[str]:
+        """
+        Construit un plan d'exécution adaptatif basé sur le profil (F24).
+
+        Returns:
+            Liste des checks à exécuter (parmi : missing_values, detect_anomalies,
+            format, drift, type, duplicates)
+        """
+        plan = ["missing_values", "type", "duplicates", "pseudo_nulls", "format"]
+
+        if context.profile is None:
+            return plan + ["detect_anomalies"]
+
+        profile = context.profile
+        row_count = profile.row_count
+        col_count = profile.column_count
+        total_nulls = profile.total_null_count
+
+        # Règle 1 : trop peu de lignes → skip IsolationForest (instable < 30 lignes)
+        if row_count >= 30:
+            plan.append("detect_anomalies")
+
+        # Règle 2 : aucun null → skip missing_values check
+        if total_nulls == 0:
+            plan = [c for c in plan if c != "missing_values"]
+
+        # Règle 3 : presque tout null (>50%) → skip format checks
+        total_cells = row_count * col_count if col_count > 0 else 1
+        if total_nulls / max(total_cells, 1) > 0.5:
+            plan = [c for c in plan if c != "format"]
+
+        # Règle 4 : trop de colonnes → mode sampling (note dans metadata)
+        if col_count > 100:
+            context.metadata["sampling_mode"] = True
+
+        # Règle 5 : pas de colonnes numériques → skip anomaly + drift
+        numeric_cols = [c for c in profile.columns if c.is_numeric]
+        if not numeric_cols:
+            plan = [c for c in plan if c not in ("detect_anomalies", "drift")]
+
+        # Règle 6 : detect_drift demandé et référence fournie → activer
+        if options.get("detect_drift") and options.get("reference_df") is not None:
+            plan.append("drift")
+
+        return plan
 
     async def _run_quality_check_async(
         self,
@@ -349,7 +511,7 @@ Tu dois être:
     def _calculate_quality_score(
         self,
         context: AgentContext,
-        df: pd.DataFrame
+        df: pd.DataFrame | None = None,
     ) -> float:
         """
         Calcule un score de qualité global (0-100).

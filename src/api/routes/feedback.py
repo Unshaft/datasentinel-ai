@@ -16,6 +16,7 @@ from src.api.schemas.responses import (
     FeedbackResponse,
     RuleResponse,
 )
+from src.core.feedback_processor import get_feedback_processor
 from src.core.models import FeedbackRequest as FeedbackRequestModel
 from src.memory.chroma_store import get_chroma_store
 from src.memory.feedback_store import get_feedback_store
@@ -69,6 +70,12 @@ async def submit_feedback(request: FeedbackRequest) -> FeedbackResponse:
 
         # Enregistrer le feedback
         response = feedback_store.record_feedback(feedback_model)
+
+        # Traitement adaptatif du feedback (F26 — best-effort)
+        try:
+            get_feedback_processor().process(request, get_chroma_store())
+        except Exception:
+            pass
 
         return FeedbackResponse(
             feedback_id=response.feedback_id,

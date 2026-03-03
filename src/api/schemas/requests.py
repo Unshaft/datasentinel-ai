@@ -43,6 +43,12 @@ class AnalyzeRequest(BaseModel):
         description="Règles métier personnalisées à ajouter"
     )
 
+    # Raisonnement adaptatif (v0.7)
+    include_reasoning: bool = Field(
+        default=False,
+        description="Utiliser l'orchestrateur adaptatif ReAct et inclure les étapes de raisonnement"
+    )
+
     class Config:
         json_schema_extra = {
             "example": {
