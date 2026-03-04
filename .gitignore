@@ -93,6 +93,15 @@ data/samples/*
 !data/samples/.gitkeep
 !data/rules/default_rules.json
 
+# Runtime data (stats, webhooks, domain agents — générés à l'exécution)
+data/stats.json
+data/webhooks.json
+data/domain_agents.json
+data/feedback_stats.json
+
+# Test data ChromaDB (binaires générés par les tests)
+test_data/
+
 # Uploaded files
 uploads/
 
