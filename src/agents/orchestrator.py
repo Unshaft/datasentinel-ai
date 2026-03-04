@@ -26,6 +26,7 @@ from src.agents.quality import QualityAgent
 from src.agents.semantic_profiler import SemanticProfilerAgent
 from src.agents.validator import ValidatorAgent
 from src.core.config import settings
+from src.core.domain_manager import DomainManager
 from src.core.models import AgentContext, AgentType, Severity, TaskStatus
 from src.ml.confidence_scorer import ConfidenceScorer
 
@@ -76,6 +77,7 @@ class OrchestratorAgent(BaseAgent):
         self.confidence_scorer = ConfidenceScorer(
             escalation_threshold=settings.confidence_threshold
         )
+        self._domain_manager = DomainManager()
 
     @property
     def system_prompt(self) -> str:
@@ -159,16 +161,22 @@ Tu dois être:
 
         elif task_type == TaskType.ANALYZE:
             context = self._run_profiling(context, df)
+            context = self._run_semantic_enrichment_sync(context, df)
+            context = self._detect_domain(context)
             context = self._run_quality_check(context, df, **options)
 
         elif task_type == TaskType.RECOMMEND:
             context = self._run_profiling(context, df)
+            context = self._run_semantic_enrichment_sync(context, df)
+            context = self._detect_domain(context)
             context = self._run_quality_check(context, df, **options)
             if context.issues:
                 context = self._run_correction(context, df)
 
         elif task_type == TaskType.FULL_PIPELINE:
             context = self._run_profiling(context, df)
+            context = self._run_semantic_enrichment_sync(context, df)
+            context = self._detect_domain(context)
             context = self._run_quality_check(context, df, **options)
             if context.issues:
                 context = self._run_correction(context, df)
@@ -223,11 +231,13 @@ Tu dois être:
         elif task_type == TaskType.ANALYZE:
             context = await asyncio.to_thread(self._run_profiling, context, df)
             context = await self.semantic_profiler.enrich_async(context, df)
+            context = self._detect_domain(context)
             context = await self._run_quality_check_async(context, df, **options)
 
         elif task_type == TaskType.RECOMMEND:
             context = await asyncio.to_thread(self._run_profiling, context, df)
             context = await self.semantic_profiler.enrich_async(context, df)
+            context = self._detect_domain(context)
             context = await self._run_quality_check_async(context, df, **options)
             if context.issues:
                 context = await asyncio.to_thread(self._run_correction, context, df)
@@ -235,6 +245,7 @@ Tu dois être:
         elif task_type == TaskType.FULL_PIPELINE:
             context = await asyncio.to_thread(self._run_profiling, context, df)
             context = await self.semantic_profiler.enrich_async(context, df)
+            context = self._detect_domain(context)
             context = await self._run_quality_check_async(context, df, **options)
             if context.issues:
                 context = await asyncio.to_thread(self._run_correction, context, df)
@@ -275,9 +286,10 @@ Tu dois être:
         logger.info("Pipeline START — %s(adaptive) %d×%d", task_type.value, len(df), len(df.columns))
         reasoning_steps: list[dict] = []
 
-        # ── Phase 1 : Observe (Profiler + Semantic enrichment) ───────────────
+        # ── Phase 1 : Observe (Profiler + Semantic enrichment + Domain) ─────
         context = await asyncio.to_thread(self._run_profiling, context, df)
         context = await self.semantic_profiler.enrich_async(context, df)
+        context = self._detect_domain(context)
         sem_count = len(context.metadata.get("semantic_types", {}))
         reasoning_steps.append({
             "step": 1,
@@ -405,6 +417,38 @@ Tu dois être:
             "reference_df": options.get("reference_df"),
         }
         return await self.quality_agent.execute_async(context, df, **quality_options)
+
+    def _run_semantic_enrichment_sync(
+        self,
+        context: AgentContext,
+        df: pd.DataFrame,
+    ) -> AgentContext:
+        """
+        Enrichissement sémantique synchrone — heuristiques (F27v2).
+
+        Popule context.metadata["semantic_types"] via le classificateur heuristique
+        du SemanticProfilerAgent, sans appel LLM. Permet à F32 (detect_domain)
+        et F28 (validate_semantic_types) de fonctionner dans le pipeline synchrone.
+        """
+        return self.semantic_profiler.enrich_sync(context, df)
+
+    def _detect_domain(self, context: AgentContext) -> AgentContext:
+        """
+        Détecte le domaine métier actif après F27 (F32 — v1.0).
+
+        Si des semantic_types sont présents dans le contexte, cherche le profil
+        DomainManager dont le ratio trigger_types est le meilleur. Le résultat
+        est stocké dans context.metadata["domain_id"] / ["domain_name"].
+        """
+        semantic_types = context.metadata.get("semantic_types")
+        if not semantic_types:
+            return context
+        matched = self._domain_manager.detect_domain(semantic_types)
+        if matched:
+            context.metadata["domain_id"] = matched.domain_id
+            context.metadata["domain_name"] = matched.name
+            logger.info("[Domain] Agent '%s' activé", matched.name)
+        return context
 
     def _run_profiling(
         self,

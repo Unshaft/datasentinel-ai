@@ -27,6 +27,7 @@ from src.api.limiter import limiter
 from src.api.routes import analyze, batch, explain, feedback, recommend, upload
 from src.api.routes import auth as auth_router
 from src.api.routes import jobs as jobs_router
+from src.api.routes import domain_agents as domain_agents_router
 from src.api.routes import rules as rules_router
 from src.api.routes import stats as stats_router
 from src.api.routes import webhooks as webhooks_router
@@ -209,9 +210,10 @@ app.include_router(explain.router,   dependencies=_auth_dep)
 app.include_router(feedback.router,  dependencies=_auth_dep)
 app.include_router(upload.router,    dependencies=_auth_dep)
 app.include_router(batch.router,       dependencies=_auth_dep)
-app.include_router(rules_router.router, dependencies=_auth_dep)
-app.include_router(jobs_router.router,  dependencies=_auth_dep)
-app.include_router(stats_router.router, dependencies=_auth_dep)
+app.include_router(rules_router.router,         dependencies=_auth_dep)
+app.include_router(jobs_router.router,          dependencies=_auth_dep)
+app.include_router(stats_router.router,         dependencies=_auth_dep)
+app.include_router(domain_agents_router.router, dependencies=_auth_dep)
 # Auth router : pas de protection (c'est le endpoint de login)
 app.include_router(auth_router.router)
 # Webhooks : pas de protection (enregistrement public)

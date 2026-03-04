@@ -175,6 +175,10 @@ if result.get("needs_human_review"):
         + ", ".join(result.get("escalation_reasons", []))
     )
 
+domain_agent = result.get("domain_agent")
+if domain_agent:
+    st.info(f"🏢 Agent métier activé : **{domain_agent}**")
+
 # =========================================================================
 # TABS
 # =========================================================================
@@ -600,8 +604,8 @@ with tab_json:
 st.divider()
 st.markdown("## Outils globaux")
 
-global_tab_stats, global_tab_jobs, global_tab_rules = st.tabs(
-    ["📊 Stats système", "⏳ Jobs asynchrones", "📋 Règles métier"]
+global_tab_stats, global_tab_jobs, global_tab_rules, global_tab_domain = st.tabs(
+    ["📊 Stats système", "⏳ Jobs asynchrones", "📋 Règles métier", "🏢 Agents Métier"]
 )
 
 
@@ -860,3 +864,183 @@ with global_tab_rules:
                             st.error(f"Erreur : {e}")
     else:
         st.info("Cliquez sur '🔄 Recharger' pour charger les règles.")
+
+
+# ---- AGENTS MÉTIER (F32 — v1.0) ----
+_SEMANTIC_TYPES_UI = [
+    "email", "phone", "first_name", "last_name", "full_name",
+    "postal_code", "address", "city", "country",
+    "identifier", "monetary_amount", "percentage", "age",
+    "date_string", "url", "ip_address",
+    "boolean_text", "category", "product_code",
+    "employee_id", "description", "free_text",
+    "quantity", "rating",
+]
+
+with global_tab_domain:
+    st.markdown("### Agents métier personnalisés (F32)")
+    st.caption(
+        "Créez des profils de validation spécialisés par domaine. "
+        "Quand un dataset est analysé, le profil dont les types sémantiques correspondent "
+        "le mieux est activé automatiquement."
+    )
+
+    da_col1, da_col2 = st.columns([2, 1])
+
+    with da_col1:
+        st.subheader("Créer un agent métier")
+        da_name = st.text_input(
+            "Nom du domaine",
+            placeholder="Ex: RH, Finance, E-Commerce",
+            key="da_name",
+        )
+        da_desc = st.text_area(
+            "Description (optionnelle)",
+            placeholder="Ex: Ressources Humaines — salary, hire_date, employee_id",
+            key="da_desc",
+            height=68,
+        )
+        da_trigger = st.multiselect(
+            "Types sémantiques déclencheurs",
+            _SEMANTIC_TYPES_UI,
+            help="Le profil sera activé si suffisamment de colonnes ont ces types sémantiques.",
+            key="da_trigger",
+        )
+        da_required = st.multiselect(
+            "Types sémantiques requis (absence → CONSTRAINT_VIOLATION CRITICAL)",
+            _SEMANTIC_TYPES_UI,
+            key="da_required",
+        )
+        da_ratio = st.slider(
+            "Seuil de détection (% des types déclencheurs présents)",
+            min_value=10, max_value=100, value=30, step=5,
+            key="da_ratio",
+            help="Ex: 30% = si 30% des types déclencheurs sont présents, activer le profil.",
+        )
+        da_rules_raw = st.text_area(
+            "Règles métier (1 règle par ligne)",
+            placeholder="Le salaire doit être positif\nL'ID employé est obligatoire et unique",
+            key="da_rules_raw",
+            height=100,
+        )
+
+        st.caption("Overrides de sévérité : choisissez un type sémantique et la sévérité à forcer.")
+        da_ov_col1, da_ov_col2 = st.columns(2)
+        with da_ov_col1:
+            da_ov_type = st.selectbox("Type sémantique", ["(aucun)"] + _SEMANTIC_TYPES_UI, key="da_ov_type")
+        with da_ov_col2:
+            da_ov_sev = st.selectbox("Sévérité forcée", ["low", "medium", "high", "critical"], index=2, key="da_ov_sev")
+        da_overrides: dict = {}
+        if da_ov_type != "(aucun)":
+            da_overrides[da_ov_type] = da_ov_sev
+
+        st.markdown("")
+        if st.button(
+            "➕ Créer l'agent métier",
+            key="btn_create_domain_agent",
+            type="primary",
+            disabled=not da_name.strip() or not da_trigger,
+        ):
+            rules_payload = [
+                {"text": line.strip()}
+                for line in da_rules_raw.strip().splitlines()
+                if line.strip()
+            ]
+            payload = {
+                "name": da_name.strip(),
+                "description": da_desc.strip(),
+                "trigger_types": da_trigger,
+                "min_match_ratio": da_ratio / 100,
+                "required_types": da_required,
+                "rules": rules_payload,
+                "severity_overrides": da_overrides,
+            }
+            try:
+                resp = requests.post(
+                    f"{api_url}/domain-agents",
+                    json=payload,
+                    headers=headers,
+                    timeout=10,
+                )
+                if resp.status_code == 201:
+                    created = resp.json()["profile"]
+                    st.success(f"✅ Agent **{created['name']}** créé (`{created['domain_id'][:8]}…`)")
+                    st.session_state.pop("domain_agents_data", None)
+                    st.rerun()
+                else:
+                    try:
+                        detail = resp.json().get("detail", resp.text)
+                    except Exception:
+                        detail = resp.text
+                    st.error(f"Erreur (HTTP {resp.status_code}) : {detail}")
+            except Exception as e:
+                st.error(f"Impossible de créer l'agent : {e}")
+
+    with da_col2:
+        st.subheader("Guide")
+        st.info(
+            "**Types déclencheurs** : types sémantiques (LLM F27) qui, s'ils représentent "
+            "≥ seuil des colonnes, activent l'agent.\n\n"
+            "**Types requis** : s'ils sont absents → issue CRITICAL.\n\n"
+            "**Overrides** : upgrade la sévérité des issues sur les colonnes concernées."
+        )
+
+    st.divider()
+    st.subheader("Agents actifs")
+
+    if st.button("🔄 Rafraîchir les agents", key="btn_reload_domains"):
+        st.session_state.pop("domain_agents_data", None)
+
+    if "domain_agents_data" not in st.session_state:
+        try:
+            da_resp = requests.get(f"{api_url}/domain-agents", headers=headers, timeout=10)
+            if da_resp.status_code == 200:
+                st.session_state["domain_agents_data"] = da_resp.json()
+        except Exception as e:
+            st.error(f"Impossible de charger les agents : {e}")
+
+    domain_agents_data = st.session_state.get("domain_agents_data")
+    if domain_agents_data:
+        count = domain_agents_data.get("count", 0)
+        st.caption(f"{count} agent(s) actif(s)")
+
+        if count == 0:
+            st.info("Aucun agent métier. Créez-en un ci-dessus.")
+        else:
+            for da in domain_agents_data.get("profiles", []):
+                with st.expander(f"🏢 **{da['name']}** — déclencheurs : {', '.join(da['trigger_types']) or '(aucun)'}"):
+                    da_info_col, da_del_col = st.columns([4, 1])
+                    with da_info_col:
+                        st.markdown(f"**ID** : `{da['domain_id']}`")
+                        if da.get("description"):
+                            st.markdown(f"**Description** : {da['description']}")
+                        st.markdown(f"**Seuil** : {da['min_match_ratio']*100:.0f}%")
+                        if da.get("required_types"):
+                            st.markdown(f"**Types requis** : {', '.join(da['required_types'])}")
+                        if da.get("severity_overrides"):
+                            overrides_str = ", ".join(
+                                f"{t}→{s}" for t, s in da["severity_overrides"].items()
+                            )
+                            st.markdown(f"**Overrides sévérité** : {overrides_str}")
+                        if da.get("rules"):
+                            st.markdown("**Règles** :")
+                            for r in da["rules"]:
+                                st.write(f"  • {r['text']}")
+                    with da_del_col:
+                        if st.button("🗑️ Supprimer", key=f"del_da_{da['domain_id']}"):
+                            try:
+                                del_r = requests.delete(
+                                    f"{api_url}/domain-agents/{da['domain_id']}",
+                                    headers=headers,
+                                    timeout=10,
+                                )
+                                if del_r.status_code == 200:
+                                    st.success(f"Agent `{da['name']}` supprimé.")
+                                    st.session_state.pop("domain_agents_data", None)
+                                    st.rerun()
+                                else:
+                                    st.error(f"Erreur : HTTP {del_r.status_code}")
+                            except Exception as e:
+                                st.error(f"Erreur : {e}")
+    else:
+        st.info("Cliquez sur '🔄 Rafraîchir les agents' pour charger les agents.")

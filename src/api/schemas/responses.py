@@ -169,6 +169,12 @@ class AnalyzeResponse(BaseModel):
         description="Classification sémantique des colonnes (opt-in LLM)"
     )
 
+    # Agent métier activé (v1.0 — F32, None si aucun profil ne correspond)
+    domain_agent: str | None = Field(
+        default=None,
+        description="Nom de l'agent métier activé (F32), None si aucun profil ne correspond"
+    )
+
     # Escalade
     needs_human_review: bool = Field(
         default=False,

@@ -22,6 +22,7 @@ import pandas as pd
 from src.agents.base import AgentResult, BaseAgent
 
 logger = logging.getLogger(__name__)
+from src.core.domain_manager import DomainManager
 from src.core.models import (
     AgentContext,
     AgentType,
@@ -255,6 +256,13 @@ Tu ne dois PAS:
         rule_issues = self._validate_against_rules(df, context)
         issues.extend(rule_issues)
 
+        # 9. Semantic-type validators (F28 — heuristique ou LLM, F27v2)
+        try:
+            semantic_issues = self._validate_semantic_types(df, context)
+            issues.extend(semantic_issues)
+        except Exception:  # noqa: BLE001
+            pass
+
         _tmap: dict[str, int] = {}
         for _iss in issues:
             _tmap[_iss.issue_type.value] = _tmap.get(_iss.issue_type.value, 0) + 1
@@ -264,6 +272,9 @@ Tu ne dois PAS:
             " ".join(f"{k}={v}" for k, v in sorted(_tmap.items())) or "none",
             int((time.time() - start_time) * 1000),
         )
+
+        # Validation domaine métier (F32)
+        self._validate_domain_rules(df, context, issues)
 
         # Mettre à jour le contexte
         context.issues = issues
@@ -912,6 +923,9 @@ Tu ne dois PAS:
         except Exception:  # noqa: BLE001
             pass
 
+        # 11. Validation domaine métier (F32)
+        self._validate_domain_rules(df, context, issues)
+
         context.issues = issues
         # Score par colonne (v0.4)
         context.metadata["column_scores"] = self._compute_column_scores(df, issues)
@@ -1136,6 +1150,97 @@ Sois concis et actionnable."""
                 ))
 
         return issues
+
+    # ------------------------------------------------------------------
+    # Validation domaine métier (F32 — v1.0)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _severity_rank(sev: "Severity") -> int:
+        return {"low": 1, "medium": 2, "high": 3, "critical": 4}.get(sev.value, 0)
+
+    def _validate_domain_rules(
+        self,
+        df: pd.DataFrame,
+        context: AgentContext,
+        issues: list[QualityIssue],
+    ) -> None:
+        """
+        Applique les contraintes du profil de domaine actif (F32).
+
+        - Vérifie les required_types : chaque type sémantique requis doit être
+          présent dans le dataset, sinon → CONSTRAINT_VIOLATION CRITICAL.
+        - Applique les severity_overrides : upgrade la sévérité des issues
+          dont la colonne est classifiée avec un type override.
+        - Stocke les règles descriptives dans context.metadata["domain_rules"].
+
+        No-op si aucun domaine n'est activé dans le contexte.
+        """
+        domain_id = context.metadata.get("domain_id")
+        if not domain_id:
+            return
+
+        try:
+            profile = DomainManager().get(domain_id)
+        except Exception:
+            return
+        if profile is None:
+            return
+
+        semantic_types: dict = context.metadata.get("semantic_types", {})
+        present_types: set[str] = {
+            info.get("semantic_type", "")
+            for info in semantic_types.values()
+            if info.get("semantic_type")
+        }
+
+        # 1. Types sémantiques requis manquants
+        for req_type in profile.required_types:
+            if req_type not in present_types:
+                issues.append(
+                    QualityIssue(
+                        issue_id=f"domain_{uuid.uuid4().hex[:8]}",
+                        issue_type=IssueType.CONSTRAINT_VIOLATION,
+                        severity=Severity.CRITICAL,
+                        column=None,
+                        row_indices=[],
+                        description=(
+                            f"[{profile.name}] Type sémantique requis absent du dataset : "
+                            f"'{req_type}'"
+                        ),
+                        details={
+                            "domain": profile.name,
+                            "domain_id": domain_id,
+                            "required_type": req_type,
+                        },
+                        affected_count=len(df),
+                        affected_percentage=100.0,
+                        confidence=0.99,
+                        detected_by=AgentType.QUALITY,
+                    )
+                )
+
+        # 2. Severity overrides sur issues existantes
+        col_to_type: dict[str, str] = {
+            col: info.get("semantic_type", "")
+            for col, info in semantic_types.items()
+            if info.get("semantic_type")
+        }
+        for issue in issues:
+            if issue.column and issue.column in col_to_type:
+                sem_type = col_to_type[issue.column]
+                override_str = profile.severity_overrides.get(sem_type)
+                if override_str:
+                    try:
+                        new_sev = Severity(override_str.lower())
+                        if self._severity_rank(new_sev) > self._severity_rank(issue.severity):
+                            issue.severity = new_sev
+                    except ValueError:
+                        pass
+
+        # 3. Règles descriptives dans metadata
+        if profile.rules:
+            context.metadata["domain_rules"] = [r.text for r in profile.rules]
 
     async def _detect_semantic_anomalies_llm(
         self,

@@ -227,6 +227,7 @@ async def analyze_dataset(
             issues_by_severity=issues_by_severity,
             column_scores=context.metadata.get("column_scores", {}),
             semantic_types=context.metadata.get("semantic_types") or None,
+            domain_agent=context.metadata.get("domain_name"),
             needs_human_review=context.metadata.get("needs_human_review", False),
             escalation_reasons=escalation_reasons
         )
@@ -318,6 +319,7 @@ async def get_analysis_results(session_id: str) -> AnalyzeResponse:
         issues_by_severity=issues_by_severity,
         column_scores=context.metadata.get("column_scores", {}),
         semantic_types=context.metadata.get("semantic_types") or None,
+        domain_agent=context.metadata.get("domain_name"),
         needs_human_review=context.metadata.get("needs_human_review", False),
         escalation_reasons=[]
     )

@@ -5,11 +5,11 @@ Chaque section documente le **pourquoi**, le **comment** et les **critères de v
 
 ---
 
-## État actuel — v0.8.0
+## État actuel — v1.1.0
 
 | Composant | État | Notes |
 |-----------|------|-------|
-| Pipeline Profiler → Quality → Corrector → Validator | ✅ Opérationnel | 155+ tests passent |
+| Pipeline Profiler → Quality → Corrector → Validator | ✅ Opérationnel | ~306 tests passent |
 | Upload CSV / Parquet (`POST /upload`) | ✅ v0.2 | `pyarrow`, validation extension + taille |
 | Métriques Prometheus (`GET /metrics`) | ✅ v0.2 | Auto-instrumenté via `prometheus-fastapi-instrumentator` |
 | Authentification JWT (`POST /auth/token`) | ✅ v0.2 | Opt-in (`AUTH_ENABLED=true`), fallback anonymous en dev |
@@ -18,7 +18,7 @@ Chaque section documente le **pourquoi**, le **comment** et les **critères de v
 | Rate limiting (`slowapi`) | ✅ v0.3 | 30/min sur `/analyze`, 10/min sur `/upload` |
 | Webhooks (`POST /webhooks`) | ✅ v0.3 | Notifications async POST JSON après analyse |
 | Rapport PDF (`GET /analyze/{id}/report.pdf`) | ✅ v0.3 | `reportlab`, export professionnel |
-| Interface Streamlit (`streamlit_app.py`) | ✅ v0.5 | Dashboard + score/colonne + corrections + Excel + batch + apply |
+| Interface Streamlit (`streamlit_app.py`) | ✅ v1.0 | 9 onglets analyse + 4 onglets globaux (stats, jobs, rules, agents métier) |
 | Détection doublons complets (Q1) | ✅ v0.4 | `df.duplicated(keep=False)`, sévérité LOW/MEDIUM/HIGH |
 | Détection pseudo-nulls (Q2) | ✅ v0.4 | "N/A", "null", "-", "unknown", etc. |
 | Validation de format (Q3) | ✅ v0.4 | Email, téléphone, URL, code postal, SIRET/SIREN |
@@ -40,6 +40,9 @@ Chaque section documente le **pourquoi**, le **comment** et les **critères de v
 | Classification sémantique LLM (`SemanticProfilerAgent`) | ✅ v0.8 | 1 appel batch Claude — classifie email/age/montant/etc. par colonne |
 | Validation sémantique QualityAgent | ✅ v0.8 | Règles métier auto selon semantic_type (négatifs, hors-plage) |
 | Export schéma sémantique (`GET /analyze/{id}/schema`) | ✅ v0.8 | JSON réutilisable avec inferred_type + semantic_type + pattern |
+| Logs console colorés | ✅ v0.9 | `ColoredFormatter`, `setup_logging()` dans lifespan FastAPI |
+| Custom Domain Agent Builder (`POST /domain-agents`) | ✅ v1.0 | DomainManager + CRUD /domain-agents + _validate_domain_rules + UI Streamlit |
+| SemanticProfiler v2 — classifieur heuristique | ✅ v1.1 | `enrich_sync()`, `_heuristic_classify()`, fusion heuristic+LLM via `_merge_results()` |
 
 ### Dette technique résolue en v0.4
 
@@ -49,11 +52,87 @@ Chaque section documente le **pourquoi**, le **comment** et les **critères de v
 | `Class Config` pydantic déprécié | Remplacé par `model_config = ConfigDict(...)` dans `responses.py` |
 | Webhooks in-memory (perdus au redémarrage) | Persistance JSON dans `./data/webhooks.json` |
 
+### Observabilité console (v0.9)
+
+| Composant | État |
+|---|---|
+| `ColoredFormatter` stdlib — `INFO/WARNING/ERROR` colorés | ✅ v0.9 |
+| `setup_logging()` appelé au démarrage FastAPI (lifespan) | ✅ v0.9 |
+| Logs Pipeline START/END dans les 3 pipelines (orchestrator) | ✅ v0.9 |
+| Logs Quality summary post-gather (nb issues par type + timing) | ✅ v0.9 |
+| Logs LLM F27 : Classifying N columns + N/M cols classifiées (Xms) | ✅ v0.9 |
+
 ### Dette technique restante
 
 | Problème | Impact | Priorité |
 | -------- | ------ | -------- |
 | Singleton `ChromaStore` problématique en tests parallèles | Flakiness potentielle | Moyenne |
+
+---
+
+## Vision architecturale — Axes d'évolution agentique
+
+*Analyse des gaps entre l'architecture actuelle (v0.9) et un système multi-agent
+"production-grade". À prendre en compte pour les versions futures.*
+
+### Ce qui fonctionne bien
+
+- **Orchestrateur vrai chef d'orchestre** : `run_pipeline_adaptive()` avec loop ReAct,
+  plan conditionnel selon le profil du dataset, `reasoning_steps` tracés et exposés.
+- **RAG actif dans la décision** (F25) : les seuils de qualité sont contextualisés par
+  les règles ChromaDB — pas juste un LLM qui répond, mais un agent qui consulte sa mémoire.
+- **Feedback loop** (F26) : le comportement évolue à partir des retours utilisateur
+  (`confidence_adjustments`, règles d'exception auto). C'est du vrai apprentissage en ligne.
+- **Classification sémantique batch** (F27) : 1 seul appel LLM pour N colonnes, vs N appels
+  individuels — décision d'efficacité importante.
+
+### Gaps identifiés pour aller plus loin
+
+#### 1. Mémoire inter-sessions (priorité haute)
+
+**Problème** : chaque analyse repart de zéro. L'orchestrateur ne sait pas que le même
+dataset a été analysé 10 fois avec toujours les mêmes issues sur les mêmes colonnes.
+
+**Évolution** : profil de dataset persisté par `dataset_id` + détection "ce dataset
+ressemble à ceux du secteur RH" → activation automatique de règles sectorielles.
+
+**Feature candidate** : `F30 — DatasetMemory` — clustering de profils par secteur,
+suggestions pro-actives, baseline qualité par dataset récurrent.
+
+#### 2. Auto-critique de l'orchestrateur (priorité moyenne)
+
+**Problème** : l'orchestrateur ne remet jamais en question les résultats du `QualityAgent`.
+Si le score semble incohérent (ex: 95/100 mais 3 CRITICAL), il finalise quand même.
+
+**Évolution** : phase "Reflect" après "Act" dans le ReAct — vérification de cohérence
+score/issues, re-planification si anomalie détectée, log de l'auto-correction.
+
+**Feature candidate** : `F31 — ReAct Reflect` — 5ème phase dans `run_pipeline_adaptive()`
+avec validation de cohérence et itération conditionnelle (max 2 iterations).
+
+#### 3. Agents spécialisés par domaine (priorité basse → haute à terme)
+
+**Problème** : 1 `QualityAgent` généraliste. Un dataset RH (colonnes `salary`, `hire_date`,
+`department`) et un dataset e-commerce (`order_id`, `sku`, `cart_value`) passent par les
+mêmes règles sans différenciation.
+
+**Évolution** : agents spécialisés `HRQualityAgent`, `FinanceQualityAgent` avec règles
+métier natives (cohérence salaire/ancienneté, contraintes RGPD sur les PII, etc.),
+sélectionnés automatiquement via le `semantic_type` du `SemanticProfilerAgent`.
+
+**Feature candidate** : `F32 — Domain Agents` — routing dans l'orchestrateur selon
+`context.metadata["domain"]` détecté par F27.
+
+#### 4. Planning dynamique multi-étapes (priorité basse)
+
+**Problème** : `_build_execution_plan()` applique 6 règles fixes. Le nombre d'itérations
+du pipeline est prédéfini, pas adaptatif à la complexité réelle.
+
+**Évolution** : planificateur qui décide du nombre d'itérations selon la densité d'issues
+et leur inter-dépendance (ex: corriger les doublons avant de recalculer les nulls).
+
+**Feature candidate** : `F33 — Iterative Planner` — `max_iterations` configurable,
+convergence détectée quand le score ne s'améliore plus entre deux passes.
 
 ---
 
@@ -925,6 +1004,114 @@ POST /feedback → FeedbackProcessor
 
 ---
 
+## v1.0 — Features livrées
+
+### Feature 32 — Custom Domain Agent Builder ✅
+
+**Motivation** : La pipeline est généraliste. Un dataset RH (salary, employee_id) et un
+dataset e-commerce (sku, cart_value) passent par les mêmes règles sans différenciation métier.
+L'utilisateur veut nommer un domaine, lui associer des types sémantiques déclencheurs, des
+champs requis, des règles descriptives et des overrides de sévérité — le tout configurable
+via une interface Streamlit.
+
+**Décision de design** :
+
+- `DomainProfile` dataclass : `name`, `trigger_types` (types sémantiques déclencheurs),
+  `min_match_ratio` (seuil de détection, ex. 0.3), `required_types` (colonnes obligatoires),
+  `rules` (règles textuelles), `severity_overrides` (upgrade de sévérité par type sémantique)
+- `DomainManager` singleton : CRUD persisté dans `./data/domain_agents.json`
+- **Détection automatique** : après F27, `detect_domain(semantic_types)` calcule pour chaque
+  profil actif `ratio = len(col_types ∩ trigger_types) / len(trigger_types)`. Profil avec
+  le meilleur ratio ≥ `min_match_ratio` est activé.
+- `_validate_domain_rules()` dans `QualityAgent` : colonnes requises manquantes →
+  `CONSTRAINT_VIOLATION CRITICAL`, severity_overrides → upgrade des issues existantes,
+  règles textuelles → `context.metadata["domain_rules"]`
+- `AnalyzeResponse.domain_agent: str | None` — nom du domaine activé ou None
+- Orchestrateur : `detect_domain()` appelé après `_run_semantic_enrichment` dans les
+  3 pipelines (sync, async, adaptive)
+
+**Fichiers créés/modifiés** :
+
+- `src/core/domain_manager.py` — `DomainProfile`, `DomainRule`, `DomainManager` singleton
+- `src/api/routes/domain_agents.py` — CRUD : GET/POST/DELETE /domain-agents
+- `src/agents/orchestrator.py` — `_detect_domain()` dans les 3 pipelines
+- `src/agents/quality.py` — `_validate_domain_rules()` en fin de `execute()` et `execute_async()`
+- `src/api/main.py` — inclusion du router `domain_agents`
+- `src/api/schemas/responses.py` — champ `domain_agent: str | None`
+- `streamlit_app.py` — badge domaine actif + onglet "🏢 Agents Métier"
+
+**Critères de validation** :
+
+- [x] POST /domain-agents crée un profil, GET liste, DELETE supprime
+- [x] Dataset avec types sémantiques correspondants → `response.domain_agent == "RH"`
+- [x] Type requis absent → CONSTRAINT_VIOLATION CRITICAL ajoutée
+- [x] severity_overrides → issues upgradées en sévérité
+- [x] 0 régression sur les 288 tests existants (domain_id absent → no-op immédiat)
+- [x] Onglet Streamlit "Agents Métier" : créer/lister/supprimer des agents
+
+---
+
+## v1.1 — Features livrées
+
+### Feature 27v2 — SemanticProfiler heuristique (sans LLM) ✅
+
+**Motivation** : F27v1 reposait entièrement sur Claude — si `ENABLE_LLM_CHECKS=false`,
+`semantic_types` restait vide, rendant F28 (validators) et F32 (domain detection)
+totalement inopérants. De plus, le pipeline synchrone (`run_pipeline`) n'appelait jamais
+`enrich_async`, créant une asymétrie invisible entre les deux pipelines.
+
+**Problèmes résolus** :
+
+1. `semantic_types` toujours vide sans LLM → F32 et F28 non-fonctionnels hors LLM
+2. Pipeline sync sans enrichissement sémantique → domain detection jamais actif en sync
+3. LLM seule source de vérité — aucun fallback partiel sur erreur ou timeout
+4. Perte totale de la classification si LLM échoue
+
+**Décision de design** :
+
+- **Classifieur heuristique** (`_heuristic_classify`) : pure Python, aucune dépendance LLM
+  - Regex sur les valeurs : email, phone, url, postal_code, ip_address
+  - Keywords sur noms de colonnes : 24 types sémantiques mappés (`salary` → `monetary_amount`)
+  - Word-boundary matching (`_is_keyword_match`) : mots isolés, évite "stage" → "age"
+  - Ranges numériques (age: [0,150], percentage: [0,100], rating: [0,10])
+  - Cardinalité faible → `category`, chaînes longues → `description`, fallback → `free_text`
+- **Niveaux de confiance** calibrés autour du seuil F28 (0.70) :
+  - 0.50 : free_text fallback
+  - 0.55–0.65 : regex/nom seul → déclenche F32 uniquement (sous 0.70, évite les faux-positifs F28)
+  - 0.75 : nom-keyword + range numérique ≥90% valide → déclenche F28 range validators
+- **`enrich_sync()`** : point d'entrée synchrone pour le pipeline sync (heuristique only)
+- **`enrich_async()` v2** : heuristique d'abord → LLM enhance si activé → `_merge_results()`
+- **`_merge_results(heuristic, llm)`** : LLM gagne seulement si confidence strictement
+  supérieure ; toutes les colonnes heuristiques conservées si LLM les ignore
+- **Symétrie sync/async** : `execute()` (sync) appelle maintenant `_validate_semantic_types()`
+  comme `execute_async()` le faisait déjà
+
+**Fichiers modifiés** :
+
+- `src/agents/semantic_profiler.py` — réécriture complète v2 : `_heuristic_classify`,
+  `enrich_sync`, `_merge_results`, `enrich_async` v2, `_classify_columns_llm` (renommé)
+- `src/agents/quality.py` — `_validate_semantic_types()` ajouté dans `execute()` sync
+- `src/agents/orchestrator.py` — `_run_semantic_enrichment_sync()` + 3 appels dans pipelines
+
+**Tests** :
+
+- 3 tests mis à jour : `test_returns_heuristic_types_when_llm_disabled`,
+  `test_fallback_on_api_error`, `test_fallback_on_timeout`
+- 18 nouveaux tests : `TestHeuristicClassifier` (11), `TestEnrichSync` (3), `TestMergeResults` (4)
+
+**Critères de validation** :
+
+- [x] `enrich_sync()` popule `semantic_types` même sans LLM
+- [x] `enrich_async()` avec `ENABLE_LLM_CHECKS=false` → tout en méthode `"heuristic"`
+- [x] `enrich_async()` avec LLM → fusion heuristique + LLM (LLM gagne si confidence > heuristique)
+- [x] Timeout ou erreur API → heuristique conservé, pas de crash
+- [x] "stage" ne classifié pas comme "age" (word-boundary)
+- [x] `sample_dirty_df.age` (8/10=80% en range) → confidence < 0.70 → 0 faux positif F28
+- [x] 0 régression sur les ~288 tests existants
+- [x] +18 nouveaux tests
+
+---
+
 ## Processus de développement
 
 ### Définition of Done (DoD)
@@ -951,4 +1138,7 @@ Une feature est **terminée** si :
 | v0.5.0 | 2026-03 | Apply-corrections (CSV propre), persistance DataFrame (parquet/base64), batch API (10 fichiers en parallèle), Streamlit v0.5 — 188/188 tests |
 | v0.6.0 | 2026-03 | Comparison before/after (F19), CRUD /rules (F20), async jobs (F21), dashboard stats (F22), Streamlit v0.6 — 210+ tests |
 | v0.7.0 | 2026-03 | LLM Quality Check opt-in (F23), orchestrateur adaptatif ReAct (F24), RAG actif seuils dynamiques (F25), feedback qui apprend (F26), Streamlit v0.7 — 275/275 tests |
-| v0.8.0 | 2026-03 | SemanticProfilerAgent batch LLM (F27), validation sémantique QualityAgent (F28), export schéma GET /schema (F29), onglet Schéma Streamlit — 300+ tests |
+| v0.8.0 | 2026-03 | SemanticProfilerAgent batch LLM (F27v1), validation sémantique QualityAgent (F28), export schéma GET /schema (F29), onglet Schéma Streamlit — 300+ tests |
+| v0.9.0 | 2026-03 | Logs console colorés (ColoredFormatter + structlog opt.), setup_logging() dans lifespan — 288/288 tests |
+| v1.0.0 | 2026-03 | Custom Domain Agent Builder (F32) : DomainManager, CRUD /domain-agents, _validate_domain_rules, onglet "Agents Métier" Streamlit — 288/288 tests |
+| v1.1.0 | 2026-03 | SemanticProfiler v2 (F27v2) : classifieur heuristique, enrich_sync, fusion heuristic+LLM, symétrie sync/async Quality — ~306 tests |

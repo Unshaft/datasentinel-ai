@@ -87,8 +87,8 @@ def df_age_outlier():
 
 class TestSemanticProfilerEnrich:
 
-    def test_returns_context_unchanged_when_disabled(self, df_mixed):
-        """ENABLE_LLM_CHECKS=False → semantic_types absent du context."""
+    def test_returns_heuristic_types_when_llm_disabled(self, df_mixed):
+        """ENABLE_LLM_CHECKS=False → semantic_types populé par l'heuristique (F27v2)."""
         from src.agents.semantic_profiler import SemanticProfilerAgent
         agent = SemanticProfilerAgent()
         context = AgentContext(session_id="test_disabled", dataset_id="ds_disabled")
@@ -97,7 +97,12 @@ class TestSemanticProfilerEnrich:
             mock_settings.enable_llm_checks = False
             result = asyncio.run(agent.enrich_async(context, df_mixed))
 
-        assert "semantic_types" not in result.metadata
+        # v2 : l'heuristique tourne toujours, même sans LLM
+        assert "semantic_types" in result.metadata
+        assert all(
+            v.get("method") == "heuristic"
+            for v in result.metadata["semantic_types"].values()
+        )
 
     def test_populates_semantic_types_in_metadata(self, df_mixed):
         """enrich_async() stocke semantic_types dans context.metadata."""
@@ -213,7 +218,7 @@ class TestSemanticProfilerEnrich:
         assert "ca_mensuel" not in user_message
 
     def test_fallback_on_api_error(self, df_mixed):
-        """Exception API → context inchangé, pas de crash."""
+        """Exception API → heuristique conservé, pas de crash (F27v2)."""
         from src.agents.semantic_profiler import SemanticProfilerAgent
 
         agent = SemanticProfilerAgent()
@@ -229,12 +234,17 @@ class TestSemanticProfilerEnrich:
 
             result = asyncio.run(agent.enrich_async(context, df_mixed))
 
-        # Pas de crash, context intact
+        # v2 : heuristique conservé même si LLM échoue
         assert result is not None
-        assert "semantic_types" not in result.metadata
+        assert "semantic_types" in result.metadata
+        # Toutes les entrées restent en mode heuristique
+        assert all(
+            v.get("method") == "heuristic"
+            for v in result.metadata["semantic_types"].values()
+        )
 
     def test_fallback_on_timeout(self, df_mixed):
-        """asyncio.TimeoutError → context inchangé, pas de crash."""
+        """asyncio.TimeoutError → heuristique conservé, pas de crash (F27v2)."""
         from src.agents.semantic_profiler import SemanticProfilerAgent
 
         agent = SemanticProfilerAgent()
@@ -253,8 +263,9 @@ class TestSemanticProfilerEnrich:
 
             result = asyncio.run(agent.enrich_async(context, df_mixed))
 
+        # v2 : heuristique conservé même si LLM timeout
         assert result is not None
-        assert "semantic_types" not in result.metadata
+        assert "semantic_types" in result.metadata
 
     def test_unknown_column_ignored_gracefully(self, df_mixed):
         """tool_use pour une colonne inexistante → ignoré, pas d'erreur."""
@@ -364,3 +375,199 @@ class TestSemanticQualityValidation:
         issues = agent._validate_semantic_types(df, context)
 
         assert issues == []
+
+
+# ---------------------------------------------------------------------------
+# Tests — Classificateur heuristique (F27 v2)
+# ---------------------------------------------------------------------------
+
+
+class TestHeuristicClassifier:
+    """Vérifie le classificateur heuristique sans LLM."""
+
+    def _agent(self):
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        return SemanticProfilerAgent()
+
+    def test_email_detected_by_regex(self):
+        """Colonne avec des emails valides → semantic_type=email."""
+        agent = self._agent()
+        df = pd.DataFrame({"email_client": [
+            "alice@test.com", "bob@example.com", "carol@test.fr",
+            "diana@mail.com", "eve@test.org",
+        ]})
+        result = agent._heuristic_classify(df, 5)
+        assert "email_client" in result
+        assert result["email_client"]["semantic_type"] == "email"
+        assert result["email_client"]["method"] == "heuristic"
+
+    def test_age_clean_column_confidence_075(self):
+        """Colonne 'age' avec toutes valeurs en [0,150] → confidence 0.75 (déclenche F28)."""
+        agent = self._agent()
+        df = pd.DataFrame({"age": [25, 30, 35, 40, 45, 28, 32, 27, 38, 42]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["age"]["semantic_type"] == "age"
+        assert result["age"]["confidence"] == 0.75
+
+    def test_age_dirty_column_below_f28_threshold(self):
+        """Colonne 'age' avec 80 % des valeurs dans la plage → confidence < 0.75."""
+        agent = self._agent()
+        # 8/10 = 80 % en [0,150] — ne doit PAS déclencher les validators F28
+        df = pd.DataFrame({"age": [25, 30, 35, 200, 28, 32, 45, 29, 31, -1]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["age"]["semantic_type"] == "age"
+        assert result["age"]["confidence"] < 0.75
+
+    def test_salary_detected_as_monetary_amount(self):
+        """Colonne 'salary' → monetary_amount."""
+        agent = self._agent()
+        df = pd.DataFrame({"salary": [50000, 60000, 55000, 70000, 65000]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["salary"]["semantic_type"] == "monetary_amount"
+
+    def test_percentage_clean_column(self):
+        """Colonne 'taux' avec valeurs en [0,100] → percentage avec confidence 0.75."""
+        agent = self._agent()
+        df = pd.DataFrame({"taux_completion": [80.0, 95.0, 70.0, 60.0, 85.0,
+                                               75.0, 90.0, 55.0, 65.0, 78.0]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["taux_completion"]["semantic_type"] == "percentage"
+        assert result["taux_completion"]["confidence"] == 0.75
+
+    def test_free_text_fallback(self):
+        """Colonne sans signal → free_text."""
+        agent = self._agent()
+        df = pd.DataFrame({"random_col": ["abc", "def", "ghi", "jkl", "mno"]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["random_col"]["semantic_type"] == "free_text"
+
+    def test_identifier_by_id_suffix(self):
+        """Colonne finissant par _id → identifier."""
+        agent = self._agent()
+        df = pd.DataFrame({"customer_id": [1, 2, 3, 4, 5]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["customer_id"]["semantic_type"] == "identifier"
+
+    def test_category_low_cardinality(self):
+        """Colonne avec faible cardinalité → category."""
+        agent = self._agent()
+        df = pd.DataFrame({"dept": ["IT", "HR", "IT", "Finance", "HR",
+                                    "IT", "Finance", "HR", "IT", "Finance"]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["dept"]["semantic_type"] == "category"
+
+    def test_max_columns_respected(self):
+        """max_columns=2 → seules 2 colonnes classifiées."""
+        agent = self._agent()
+        df = pd.DataFrame({"a": [1], "b": [2], "c": [3]})
+        result = agent._heuristic_classify(df, 2)
+        assert len(result) == 2
+
+    def test_no_false_positive_stage_for_age(self):
+        """'stage' ne doit PAS être classifié comme 'age' (évite substring 'age' dans 'stage')."""
+        agent = self._agent()
+        df = pd.DataFrame({"stage": ["A", "B", "C", "A", "B"]})
+        result = agent._heuristic_classify(df, 5)
+        assert result["stage"]["semantic_type"] != "age"
+
+    def test_all_columns_have_method_heuristic(self):
+        """Toutes les entrées heuristiques portent method='heuristic'."""
+        agent = self._agent()
+        df = pd.DataFrame({
+            "email": ["a@b.com", "c@d.com"],
+            "age": [25, 30],
+            "unknown": ["x", "y"],
+        })
+        result = agent._heuristic_classify(df, 10)
+        assert all(v["method"] == "heuristic" for v in result.values())
+
+
+# ---------------------------------------------------------------------------
+# Tests — enrich_sync (F27 v2)
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichSync:
+    """Vérifie enrich_sync() — toujours disponible sans LLM."""
+
+    def test_always_populates_semantic_types(self):
+        """enrich_sync popule semantic_types même quand LLM désactivé."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        agent = SemanticProfilerAgent()
+        df = pd.DataFrame({"email": ["alice@test.com", "bob@test.com", "carol@test.fr"]})
+        context = AgentContext(session_id="s1", dataset_id="d1")
+
+        result = agent.enrich_sync(context, df)
+
+        assert "semantic_types" in result.metadata
+        assert "email" in result.metadata["semantic_types"]
+
+    def test_returns_context_unchanged_if_empty_df(self):
+        """DataFrame vide → semantic_types vide, pas de crash."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        agent = SemanticProfilerAgent()
+        df = pd.DataFrame()
+        context = AgentContext(session_id="s2", dataset_id="d2")
+
+        result = agent.enrich_sync(context, df)
+
+        assert "semantic_types" in result.metadata
+        assert result.metadata["semantic_types"] == {}
+
+    def test_does_not_call_llm(self):
+        """enrich_sync ne doit jamais appeler anthropic."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        agent = SemanticProfilerAgent()
+        df = pd.DataFrame({"age": [25, 30, 35]})
+        context = AgentContext(session_id="s3", dataset_id="d3")
+
+        with patch("anthropic.AsyncAnthropic") as MockClient:
+            agent.enrich_sync(context, df)
+            MockClient.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests — _merge_results (F27 v2)
+# ---------------------------------------------------------------------------
+
+
+class TestMergeResults:
+    """Vérifie la fusion heuristique + LLM."""
+
+    def test_llm_wins_when_higher_confidence(self):
+        """LLM avec confidence plus haute remplace l'heuristique."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        heuristic = {"col1": {"semantic_type": "free_text", "confidence": 0.62, "method": "heuristic"}}
+        llm = {"col1": {"semantic_type": "email", "confidence": 0.95}}
+        merged = SemanticProfilerAgent._merge_results(heuristic, llm)
+        assert merged["col1"]["semantic_type"] == "email"
+        assert merged["col1"]["method"] == "llm"
+
+    def test_heuristic_kept_when_llm_lower(self):
+        """Heuristique conservé si LLM moins confiant."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        heuristic = {"col1": {"semantic_type": "age", "confidence": 0.75, "method": "heuristic"}}
+        llm = {"col1": {"semantic_type": "free_text", "confidence": 0.60}}
+        merged = SemanticProfilerAgent._merge_results(heuristic, llm)
+        assert merged["col1"]["semantic_type"] == "age"
+
+    def test_llm_adds_missing_columns(self):
+        """LLM peut ajouter des colonnes non détectées par l'heuristique."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        heuristic = {"col1": {"semantic_type": "age", "confidence": 0.75, "method": "heuristic"}}
+        llm = {"col2": {"semantic_type": "email", "confidence": 0.95}}
+        merged = SemanticProfilerAgent._merge_results(heuristic, llm)
+        assert "col1" in merged
+        assert "col2" in merged
+
+    def test_heuristic_columns_preserved_if_llm_misses_them(self):
+        """Colonnes non retournées par LLM → classification heuristique conservée."""
+        from src.agents.semantic_profiler import SemanticProfilerAgent
+        heuristic = {
+            "col1": {"semantic_type": "age", "confidence": 0.75, "method": "heuristic"},
+            "col2": {"semantic_type": "email", "confidence": 0.65, "method": "heuristic"},
+        }
+        llm = {"col1": {"semantic_type": "age", "confidence": 0.90}}
+        merged = SemanticProfilerAgent._merge_results(heuristic, llm)
+        assert "col2" in merged
+        assert merged["col2"]["method"] == "heuristic"
