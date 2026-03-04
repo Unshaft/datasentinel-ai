@@ -270,9 +270,8 @@ class SemanticProfilerAgent:
         # Colonnes object
         if series.dtype == object:
             n_unique = series.nunique()
-            # Faible cardinalité → category
-            card_threshold = max(2, int(n_non_null * 0.10))
-            if n_non_null >= 3 and 2 <= n_unique <= min(10, card_threshold):
+            # Faible cardinalité → category (≤10 valeurs distinctes et ratio ≤40%)
+            if n_non_null >= 5 and 2 <= n_unique <= 10 and n_unique / n_non_null <= 0.40:
                 return "category", 0.60
             # Chaînes longues → description
             if series.astype(str).str.len().mean() > 50:

@@ -12,6 +12,63 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 # =============================================================================
+# DATASET MEMORY (v1.2 — F30)
+# =============================================================================
+
+
+class DatasetMemoryInfo(BaseModel):
+    """Résumé de la mémoire inter-sessions pour AnalyzeResponse (F30 — v1.2)."""
+
+    dataset_id: str
+    is_known: bool = Field(description="True si ce dataset avait déjà été analysé")
+    session_count: int = Field(description="Nombre total d'analyses enregistrées")
+    avg_quality_score: float = Field(description="Score moyen sur toutes les sessions")
+    trend: str = Field(description="'new' | 'improving' | 'degrading' | 'stable'")
+    recurring_issues: list[str] = Field(
+        default_factory=list,
+        description="Top 3 types d'issues les plus fréquents"
+    )
+    suggested_rules: list[str] = Field(
+        default_factory=list,
+        description="Suggestions de règles pro-actives générées automatiquement"
+    )
+
+
+class DatasetSessionInfo(BaseModel):
+    """Résumé d'une session dans l'historique dataset (F30 — v1.2)."""
+
+    session_id: str
+    timestamp: str
+    quality_score: float
+    issue_counts: dict[str, int] = Field(default_factory=dict)
+    top_columns: list[str] = Field(default_factory=list)
+
+
+class DatasetHistoryResponse(BaseModel):
+    """Historique complet d'un dataset — GET /datasets/{id}/history (F30 — v1.2)."""
+
+    dataset_id: str
+    first_seen: str
+    last_seen: str
+    session_count: int
+    avg_quality_score: float
+    trend: str
+    recurring_issues: dict[str, int] = Field(
+        default_factory=dict,
+        description="issue_type → nombre de sessions concernées"
+    )
+    problematic_columns: dict[str, int] = Field(
+        default_factory=dict,
+        description="col_name → nombre de sessions avec une issue sur cette colonne"
+    )
+    suggested_rules: list[str] = Field(default_factory=list)
+    sessions: list[DatasetSessionInfo] = Field(
+        default_factory=list,
+        description="10 dernières sessions enregistrées"
+    )
+
+
+# =============================================================================
 # SEMANTIC SCHEMA (v0.8 — F27/F29)
 # =============================================================================
 
@@ -173,6 +230,24 @@ class AnalyzeResponse(BaseModel):
     domain_agent: str | None = Field(
         default=None,
         description="Nom de l'agent métier activé (F32), None si aucun profil ne correspond"
+    )
+
+    # Mémoire inter-sessions (v1.2 — F30, None si feature désactivée)
+    dataset_memory: DatasetMemoryInfo | None = Field(
+        default=None,
+        description="Historique et tendance qualité pour ce dataset (F30)"
+    )
+
+    # ReAct Reflect (v1.3 — F31, vide si pipeline standard)
+    reflect_flags: list[str] = Field(
+        default_factory=list,
+        description="Flags d'incohérence détectés par la phase Reflect (F31)"
+    )
+
+    # Étapes du raisonnement ReAct (v0.7 — F24, vide si include_reasoning=false)
+    reasoning_steps: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Étapes du raisonnement ReAct (F24)"
     )
 
     # Escalade

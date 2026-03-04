@@ -78,6 +78,9 @@ class TestPdfReport:
         assert response.status_code == 404
 
 
+openpyxl = pytest.importorskip("openpyxl", reason="openpyxl non installé")
+
+
 class TestXlsxReport:
     """Export Excel d'une session existante (v0.4)."""
 

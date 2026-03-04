@@ -157,7 +157,11 @@ class TestSemanticProfilerEnrich:
         assert "confidence" in entry
 
     def test_batch_classifies_multiple_columns(self, df_mixed):
-        """N colonnes retournées par le LLM → N entrées dans semantic_types."""
+        """Toutes les colonnes sont dans semantic_types après merge heuristique+LLM.
+
+        v2 : l'heuristique pré-classifie toutes les colonnes. Le LLM enrichit
+        certaines d'entre elles. Le merge retourne autant d'entrées que de colonnes.
+        """
         from src.agents.semantic_profiler import SemanticProfilerAgent
 
         response = _make_anthropic_response(
@@ -180,7 +184,11 @@ class TestSemanticProfilerEnrich:
             result = asyncio.run(agent.enrich_async(context, df_mixed))
 
         sem = result.metadata["semantic_types"]
-        assert len(sem) == 3
+        # Toutes les colonnes du DataFrame sont présentes (heuristique + LLM merge)
+        assert len(sem) == len(df_mixed.columns)
+        # Les colonnes enrichies par le LLM (confidence > heuristique) ont method=llm
+        assert sem["email_client"]["method"] == "llm"
+        assert sem["email_client"]["semantic_type"] == "email"
 
     def test_max_columns_limit_respected(self, df_mixed):
         """max_columns=2 → le message batch ne traite que 2 colonnes max."""
@@ -435,9 +443,15 @@ class TestHeuristicClassifier:
         assert result["taux_completion"]["confidence"] == 0.75
 
     def test_free_text_fallback(self):
-        """Colonne sans signal → free_text."""
+        """Colonne sans signal → free_text.
+
+        Les valeurs ont trop de cardinalité pour être 'category' (>40%) mais ne sont
+        pas toutes uniques (évite 'identifier'). Aucun regex ni mot-clé ne correspond.
+        """
         agent = self._agent()
-        df = pd.DataFrame({"random_col": ["abc", "def", "ghi", "jkl", "mno"]})
+        # 3 valeurs uniques sur 5 lignes = 60% cardinalité → pas category (>40%)
+        # Non toutes uniques → pas identifier
+        df = pd.DataFrame({"random_col": ["abc", "def", "ghi", "abc", "ghi"]})
         result = agent._heuristic_classify(df, 5)
         assert result["random_col"]["semantic_type"] == "free_text"
 

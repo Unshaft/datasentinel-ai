@@ -312,3 +312,129 @@ class TestRunPipelineAdaptive:
 
         assert result is not None
         assert "quality_score" in result.metadata
+
+
+# ---------------------------------------------------------------------------
+# Tests sur la phase Reflect (F31 — v1.2)
+# ---------------------------------------------------------------------------
+
+class TestReflectPhase:
+    """Tests pour la phase Reflect de run_pipeline_adaptive (F31)."""
+
+    def test_reflect_step_in_reasoning(self, mock_decision_logger, mock_chroma_store, df_normal):
+        """La phase 'reflect' est toujours présente dans reasoning_steps."""
+        from src.agents.orchestrator import TaskType
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_reflect_present", dataset_id="ds_rp")
+
+        result = asyncio.run(
+            orch.run_pipeline_adaptive(context, df_normal, task_type=TaskType.ANALYZE)
+        )
+
+        phases = [s["phase"] for s in result.metadata["reasoning_steps"]]
+        assert "reflect" in phases
+
+    def test_reflect_flags_in_metadata(self, mock_decision_logger, mock_chroma_store, df_normal):
+        """reflect_flags est toujours présent dans context.metadata après adaptive pipeline."""
+        from src.agents.orchestrator import TaskType
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_reflect_meta", dataset_id="ds_rm")
+
+        result = asyncio.run(
+            orch.run_pipeline_adaptive(context, df_normal, task_type=TaskType.ANALYZE)
+        )
+
+        assert "reflect_flags" in result.metadata
+        assert isinstance(result.metadata["reflect_flags"], list)
+
+    def test_reflect_no_flags_clean_data(self, mock_decision_logger, mock_chroma_store):
+        """Dataset propre → pas de flag 'score_vs_critical'."""
+        from src.agents.orchestrator import TaskType
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_reflect_clean", dataset_id="ds_rc")
+        df_clean = pd.DataFrame({
+            "id": range(50),
+            "value": [float(i) for i in range(50)],
+        })
+
+        result = asyncio.run(
+            orch.run_pipeline_adaptive(context, df_clean, task_type=TaskType.ANALYZE)
+        )
+
+        flags = result.metadata.get("reflect_flags", [])
+        assert "score_vs_critical" not in flags
+
+    def test_reflect_coherence_score_vs_critical(self, mock_decision_logger, mock_chroma_store):
+        """_reflect_coherence : avg_col ≥ 80 et 2+ CRITICAL → flag 'score_vs_critical'."""
+        from src.core.models import AgentType, IssueType, QualityIssue
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_svc", dataset_id="ds_svc")
+
+        context.metadata["column_scores"] = {"col_a": 90.0, "col_b": 85.0}
+        for i in range(2):
+            context.issues.append(QualityIssue(
+                issue_id=f"issue_crit_{i}",
+                issue_type=IssueType.CONSTRAINT_VIOLATION,
+                severity=Severity.CRITICAL,
+                column=None,
+                description="Domain rule violation",
+                affected_count=1,
+                affected_percentage=10.0,
+                confidence=0.9,
+                detected_by=AgentType.QUALITY,
+            ))
+
+        df = pd.DataFrame({"col_a": range(10), "col_b": range(10)})
+        flags = orch._reflect_coherence(context, df)
+        assert "score_vs_critical" in flags
+
+    def test_reflect_coherence_plan_blind_spot(self, mock_decision_logger, mock_chroma_store):
+        """_reflect_coherence : plan sans detect_anomalies + 2 issues HIGH → 'plan_blind_spot'."""
+        from src.core.models import AgentType, IssueType, QualityIssue
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_pbs", dataset_id="ds_pbs")
+
+        context.metadata["execution_plan"] = ["missing_values", "type", "duplicates"]
+        for i in range(2):
+            context.issues.append(QualityIssue(
+                issue_id=f"issue_high_{i}",
+                issue_type=IssueType.ANOMALY,
+                severity=Severity.HIGH,
+                column="value",
+                description="High severity anomaly",
+                affected_count=5,
+                affected_percentage=10.0,
+                confidence=0.9,
+                detected_by=AgentType.QUALITY,
+            ))
+
+        df = pd.DataFrame({"value": range(10)})
+        flags = orch._reflect_coherence(context, df)
+        assert "plan_blind_spot" in flags
+
+    def test_reflect_coherence_no_flag_normal(self, mock_decision_logger, mock_chroma_store):
+        """_reflect_coherence : situation normale → liste vide."""
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_no_flag", dataset_id="ds_nf")
+
+        context.metadata["column_scores"] = {"col_a": 70.0}
+        context.metadata["execution_plan"] = ["missing_values", "detect_anomalies"]
+
+        df = pd.DataFrame({"col_a": range(10)})
+        flags = orch._reflect_coherence(context, df)
+        assert flags == []
+
+    def test_execution_plan_stored_in_metadata(
+        self, mock_decision_logger, mock_chroma_store, df_normal
+    ):
+        """execution_plan est stocké dans context.metadata après run_pipeline_adaptive."""
+        from src.agents.orchestrator import TaskType
+        orch = _make_orchestrator(mock_decision_logger, mock_chroma_store)
+        context = AgentContext(session_id="test_plan_meta", dataset_id="ds_pm")
+
+        result = asyncio.run(
+            orch.run_pipeline_adaptive(context, df_normal, task_type=TaskType.ANALYZE)
+        )
+
+        assert "execution_plan" in result.metadata
+        assert isinstance(result.metadata["execution_plan"], list)

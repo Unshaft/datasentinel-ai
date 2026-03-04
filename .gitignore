@@ -98,6 +98,7 @@ data/stats.json
 data/webhooks.json
 data/domain_agents.json
 data/feedback_stats.json
+data/dataset_memory.json
 
 # Test data ChromaDB (binaires générés par les tests)
 test_data/

@@ -23,6 +23,7 @@ from src.api.schemas.responses import (
 from src.core.config import settings
 from src.core.exceptions import DataSentinelError
 from src.core.models import AgentContext
+from src.core.dataset_memory import compute_dataset_id, get_dataset_memory_manager
 from src.core.stats_manager import get_stats_manager
 from src.core.webhook_manager import fire_webhooks
 from src.memory.session_store import get_session_store
@@ -204,9 +205,11 @@ async def upload_and_analyze(
     # --- Pipeline async — quality checks en parallèle ---
     try:
         orchestrator = OrchestratorAgent()
+        dataset_id = compute_dataset_id(df)
+        was_known_before = get_dataset_memory_manager().get_entry(dataset_id) is not None
         context = AgentContext(
             session_id=f"session_{uuid.uuid4().hex[:12]}",
-            dataset_id=f"dataset_{uuid.uuid4().hex[:8]}",
+            dataset_id=dataset_id,
         )
         context = await orchestrator.run_pipeline_async(
             context, df, task_type=TaskType.ANALYZE
@@ -249,8 +252,11 @@ async def upload_and_analyze(
         column_scores=context.metadata.get("column_scores", {}),
         semantic_types=context.metadata.get("semantic_types") or None,
         domain_agent=context.metadata.get("domain_name"),
+        reflect_flags=context.metadata.get("reflect_flags", []),
+        reasoning_steps=context.metadata.get("reasoning_steps", []),
         needs_human_review=context.metadata.get("needs_human_review", False),
         escalation_reasons=escalation_reasons,
+        dataset_memory=None,  # rempli après record_session ci-dessous
     )
 
     # Persister la session + DataFrame (best-effort)
@@ -268,6 +274,21 @@ async def upload_and_analyze(
             context.metadata.get("quality_score", 100),
             issue_types,
         )
+    except Exception:
+        pass
+
+    # Dataset memory (best-effort)
+    try:
+        mem = get_dataset_memory_manager()
+        mem.record_session(
+            dataset_id=context.dataset_id,
+            session_id=context.session_id,
+            quality_score=context.metadata.get("quality_score", 100),
+            issues=context.issues,
+        )
+        mem_info = mem.get_memory_info(context.dataset_id, was_known_before)
+        from src.api.schemas.responses import DatasetMemoryInfo
+        response.dataset_memory = DatasetMemoryInfo(**mem_info)
     except Exception:
         pass
 

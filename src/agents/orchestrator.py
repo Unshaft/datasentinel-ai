@@ -269,13 +269,14 @@ Tu dois être:
         **options: Any,
     ) -> AgentContext:
         """
-        Pipeline adaptatif ReAct (F24 — v0.7).
+        Pipeline adaptatif ReAct (F24 — v0.7, F31 — v1.2).
 
         Phases :
         1. Observe  — Profiler exécuté en premier
         2. Reason   — _build_execution_plan() décide les checks à lancer
         3. Act      — Quality checks sélectifs
-        4. Observe  — Si CRITICAL → re-planification
+        4. Reflect  — Cohérence scores/issues, flags d'incohérence (F31)
+        5. Observe  — Si CRITICAL → activation Corrector
 
         Le raisonnement est tracé dans context.metadata["reasoning_steps"].
         L'API expose ces étapes si include_reasoning=True dans la requête.
@@ -305,6 +306,7 @@ Tu dois être:
 
         # ── Phase 2 : Reason (plan adaptatif) ────────────────────────────────
         plan = self._build_execution_plan(context, df, **options)
+        context.metadata["execution_plan"] = plan  # exposé pour Reflect (F31)
         logger.info("[ReAct] Plan: %s", " + ".join(plan))
         reasoning_steps.append({
             "step": 2,
@@ -330,11 +332,32 @@ Tu dois être:
             "observation": f"{len(context.issues)} problèmes détectés.",
         })
 
-        # ── Phase 4 : Observe (re-plan si critique) ──────────────────────────
+        # ── Phase 4 : Reflect (cohérence scores/issues — F31) ────────────────
+        reflect_flags = self._reflect_coherence(context, df)
+        context.metadata["reflect_flags"] = reflect_flags
+        if reflect_flags:
+            logger.info("[ReAct/Reflect] Flags d'incohérence: %s", reflect_flags)
+        col_scores = context.metadata.get("column_scores", {})
+        avg_col = round(sum(col_scores.values()) / len(col_scores), 1) if col_scores else 100.0
+        n_crit_reflect = sum(1 for i in context.issues if i.severity.value == "critical")
+        reasoning_steps.append({
+            "step": 4,
+            "phase": "reflect",
+            "thought": (
+                f"Cohérence : avg_col={avg_col:.0f}%, {n_crit_reflect} critique(s), "
+                f"anomaly_in_plan={'detect_anomalies' in plan}."
+            ),
+            "action": "_reflect_coherence()",
+            "observation": (
+                f"Flags: {reflect_flags}." if reflect_flags else "Aucune incohérence détectée."
+            ),
+        })
+
+        # ── Phase 5 : Observe (re-plan si critique) ──────────────────────────
         critical = [i for i in context.issues if i.severity.value == "critical"]
         if critical and task_type in (TaskType.RECOMMEND, TaskType.FULL_PIPELINE):
             reasoning_steps.append({
-                "step": 4,
+                "step": 5,
                 "phase": "observe",
                 "thought": f"{len(critical)} problème(s) critique(s) → activation Corrector.",
                 "action": "corrector.execute()",
@@ -351,6 +374,44 @@ Tu dois être:
             context.metadata.get("processing_time_ms", 0),
         )
         return context
+
+    def _reflect_coherence(
+        self,
+        context: AgentContext,
+        df: pd.DataFrame,
+    ) -> list[str]:
+        """
+        Vérifie la cohérence entre scores colonnes et issues détectées (F31 — v1.2).
+
+        Deux règles :
+        - score_vs_critical : scores colonnes ≥ 80 en moyenne mais ≥ 2 issues CRITICAL
+          (signale des violations domaine ajoutées après le scoring par colonne)
+        - plan_blind_spot : detect_anomalies absent du plan mais ≥ 2 issues HIGH/CRITICAL
+          (signale que le plan adaptatif a peut-être raté des anomalies)
+
+        Returns:
+            Liste de flags d'incohérence (vide si cohérent).
+        """
+        flags: list[str] = []
+
+        # Règle 1 : scores colonnes bons mais issues CRITICAL présentes
+        col_scores = context.metadata.get("column_scores", {})
+        n_critical = sum(1 for i in context.issues if i.severity.value == "critical")
+        if col_scores and n_critical >= 2:
+            avg = sum(col_scores.values()) / len(col_scores)
+            if avg >= 80.0:
+                flags.append("score_vs_critical")
+
+        # Règle 2 : plan a sauté detect_anomalies mais issues HIGH/CRITICAL détectées
+        plan = context.metadata.get("execution_plan", [])
+        if plan and "detect_anomalies" not in plan:
+            n_high_plus = sum(
+                1 for i in context.issues if i.severity.value in ("high", "critical")
+            )
+            if n_high_plus >= 2:
+                flags.append("plan_blind_spot")
+
+        return flags
 
     def _build_execution_plan(
         self,
